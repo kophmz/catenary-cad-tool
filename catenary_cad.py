@@ -24,6 +24,10 @@ catenary_cad — CAD COM 交互封装（GstarCAD / AutoCAD 通用）
 """
 
 import math
+import os
+import subprocess
+import time
+import winreg
 
 # ─── 图层与颜色（全项目唯一出处）──────────────────────────────────────
 LAYER_NAME = "悬链线"
@@ -54,6 +58,351 @@ _CAD_LABELS = {
     "GstarCAD.Application": "GstarCAD",
     "AutoCAD.Application": "AutoCAD",
 }
+
+
+def _list_cad_progids(prefix: str) -> list[str]:
+    """动态枚举注册表中以 prefix 开头的所有 ProgID（含版本号），版本新者在前。
+
+    例如本机同时装了 AutoCAD 2020 与 2022 时，无版本别名
+    `AutoCAD.Application` 只指向最后注册的 2022，但用户可能开着 2020 实例——
+    仅靠别名永远连不上旧版实例（GetActiveObject 按 2022 的 CLSID 查 ROT 落空）。
+    必须把 `AutoCAD.Application.23/.24` 等版本化 ProgID 全部枚举出来逐个尝试。
+
+    排序：裸 ProgID（无后缀）最前（保持"最新版本优先"语义），
+    其余按版本数字降序（.24 → .23 → …）。
+    """
+    found: list[str] = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "") as hk:
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(hk, i)
+                    i += 1
+                    if name.lower().startswith(prefix.lower()):
+                        found.append(name)
+                except OSError:
+                    break
+    except Exception:
+        pass
+
+    def _ver(p: str) -> tuple[int, ...]:
+        return tuple(int(x) for x in p.split(".")[2:] if x.isdigit())
+
+    bare = [p for p in found if p.lower() == prefix.lower()]
+    vers = [p for p in found if p.lower() != prefix.lower()]
+    vers.sort(key=_ver, reverse=True)
+    return bare + vers
+
+
+def _cad_label(progid: str) -> str:
+    """把 ProgID 映射为人类可读的 CAD 名（兼容带版本号后缀的 ProgID）。
+
+    例如 'AutoCAD.Application.23.1' → 'AutoCAD'（2020 的版本化 ProgID）。
+    """
+    for base, label in _CAD_LABELS.items():
+        if progid == base or progid.lower().startswith(base.lower()):
+            return label
+    return progid
+
+
+# ─── COM 错误诊断 ───────────────────────────────────────────────────
+
+def _hr_code(exc: Exception) -> int | None:
+    """从 COM 异常中提取 HRESULT 错误码（十进制）。"""
+    if exc is None:
+        return None
+    # pywin32 抛出的异常通常有 hresult 属性或 args[0] 是整数
+    for attr in ("hresult", "errno", "winerror"):
+        try:
+            v = getattr(exc, attr, None)
+            if isinstance(v, int):
+                return v
+        except Exception:
+            pass
+    for arg in exc.args:
+        if isinstance(arg, int):
+            return arg
+    return None
+
+
+def _classify_com_error(exc: Exception) -> tuple[str, str]:
+    """把 COM 异常分类为 (简短类型, 用户可读说明+建议)。"""
+    hr = _hr_code(exc)
+    msg = str(exc)
+    if hr is not None:
+        # 统一转成 32 位有符号/无符号再判断
+        hr_u = hr & 0xFFFFFFFF
+        if hr_u == 0x800401F3 or hr_u == 0x80040154:
+            return (
+                "CAD 未注册",
+                "当前 Windows 注册表中找不到 AutoCAD / GstarCAD 的 COM 标识。\n"
+                "常见原因：\n"
+                "  1) 本机未安装 AutoCAD 或 GstarCAD；\n"
+                "  2) 安装的是绿色版/精简版，未写入注册表；\n"
+                "  3) 操作系统为 64 位，但运行了 32 位 Python/COM，"
+                "无法读取 64 位注册表。\n\n"
+                "建议：用 64 位 Python 运行；或重装 CAD 并勾选“用于第三方应用程序的 COM 支持”。",
+            )
+        if hr_u == 0x800702EC:
+            return (
+                "需要管理员权限",
+                "CAD 进程与当前工具权限不一致（通常 CAD 以管理员运行，而工具没有）。\n"
+                "建议：右键本工具 →“以管理员身份运行”；或者把 CAD 也改成普通用户权限启动。",
+            )
+        if hr_u == 0x800401E3 or hr_u == 0x80040001:
+            return (
+                "CAD 服务器不可用",
+                "COM 服务器没有响应。请确认 CAD 已正常启动并至少打开了一个图纸。",
+            )
+        if hr_u == 0x80010105:
+            return (
+                "CAD 内部错误",
+                "CAD 进程内部出错（RPC_E_SERVERFAULT）。请尝试保存图纸后重启 CAD。",
+            )
+    if "无效的类字符串" in msg or "Class not registered" in msg:
+        return (
+            "CAD 未注册",
+            "当前 Windows 注册表中找不到 AutoCAD / GstarCAD 的 COM 标识。\n"
+            "建议：确认本机已安装 CAD；如已安装，尝试用 64 位 Python 运行本工具。",
+        )
+    if "需要提升" in msg or "elevation" in msg.lower():
+        return (
+            "需要管理员权限",
+            "CAD 与工具权限不一致。建议右键本工具 →“以管理员身份运行”。",
+        )
+    return ("连接失败", msg)
+
+
+def list_registered_cad() -> dict[str, list[str]]:
+    """扫描注册表，返回本机已注册的 CAD ProgID 列表。
+
+    Returns:
+        {"AutoCAD": ["AutoCAD.Application", ...], "GstarCAD": [...]}
+        若某类为空，表示注册表中未找到对应 COM 注册项。
+    """
+    result: dict[str, list[str]] = {"AutoCAD": [], "GstarCAD": []}
+    for label, progids in [
+        # 动态枚举（含版本化 ProgID，如 AutoCAD.Application.23/.24）
+        ("GstarCAD", _list_cad_progids("GCAD.Application")
+         + _list_cad_progids("GstarCAD.Application")),
+        ("AutoCAD", _list_cad_progids("AutoCAD.Application")),
+    ]:
+        for progid in progids:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, progid) as key:
+                    # 存在 ProgID 键就算注册；进一步检查 CLSID 更严谨
+                    try:
+                        with winreg.OpenKey(key, "CLSID") as clsid_key:
+                            winreg.QueryValueEx(clsid_key, "")  # 仅确认可读
+                    except FileNotFoundError:
+                        continue
+                result[label].append(progid)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+    return result
+
+
+def diagnose_cad_connection(prefer: str | None = None) -> str:
+    """生成一段人类可读的 CAD 连接诊断报告。"""
+    reg = list_registered_cad()
+    lines = ["本机 CAD COM 注册状态："]
+    for label in ("AutoCAD", "GstarCAD"):
+        if reg[label]:
+            lines.append(f"  {label}: 已注册 ({', '.join(reg[label])})")
+        else:
+            lines.append(f"  {label}: 未注册")
+    total = sum(len(v) for v in reg.values())
+    if total == 0:
+        lines.append("\n结论：注册表中没有发现 AutoCAD / GstarCAD 的 COM 项。")
+        lines.append("请先确认 CAD 已安装；如已安装，尝试用 64 位 Python 重新运行本工具。")
+    else:
+        lines.append("\n注册表项正常，但 GetActiveObject/Dispatch 仍可能因权限、CAD 未启动等失败。")
+    return "\n".join(lines)
+
+
+# ─── 提权处理（外部设备版移植）───────────────────────────────────────
+
+def _is_elevation_error(e):
+    """判断 COM 异常是否由 UAC 提权失败引起（非管理员环境最常见）。
+
+    AutoCAD 的 COM LocalServer 注册为需要提权，非管理员进程通过
+    Dispatch 激活时 Windows 拒绝启动 → CO_E_SERVER_EXEC_FAILURE (0x80010124)
+    或返回"请求的操作需要提升"。
+    """
+    s = str(e).lower()
+    return any(k in s for k in ("提升", "elevation", "server exec"))
+
+
+def _get_cad_exe_path(progid):
+    """从注册表 LocalServer32 查找 CAD 可执行文件路径。
+
+    Dispatch 因 UAC 提权失败时，用此路径通过 subprocess 直接启动 CAD
+    （不走 COM 激活，不触发提权），再用 GetActiveObject 连接。
+    """
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"{progid}\\CLSID")
+        clsid = winreg.QueryValue(key, "")
+        winreg.CloseKey(key)
+        server_key = winreg.OpenKey(
+            winreg.HKEY_CLASSES_ROOT, f"CLSID\\{clsid}\\LocalServer32")
+        raw = winreg.QueryValue(server_key, "")
+        winreg.CloseKey(server_key)
+        # LocalServer32 值形如 "D:\\...\\acad.exe /Automation" 或
+        # "\"D:\\...\\acad.exe\" /Automation"。需要正确提取 exe 路径。
+        raw = raw.strip()
+        if raw.startswith('"'):
+            end = raw.find('"', 1)
+            if end > 0:
+                candidate = raw[1:end]
+                if os.path.isfile(candidate):
+                    return candidate
+        # 不带引号：路径可能含空格，逐段拼接直到找到存在的 exe 文件
+        parts = raw.split()
+        for i in range(len(parts), 0, -1):
+            candidate = " ".join(parts[:i])
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+    except Exception:
+        return None
+
+
+def _launch_cad_and_connect(progid, timeout=60):
+    """当 Dispatch 因 UAC 提权失败时，直接启动 CAD 进程再连接。
+
+    流程：
+      1. 从注册表读取 CAD exe 路径
+      2. subprocess.Popen 启动（不走 COM 激活，不需要提权）
+      3. 轮询 GetActiveObject，等 CAD 完成 COM 注册（最多 timeout 秒）
+    返回 COM 对象或 None。
+    """
+    win32com, _, _, _ = _win32()
+    exe_path = _get_cad_exe_path(progid)
+    if not exe_path or not os.path.isfile(exe_path):
+        return None
+    try:
+        subprocess.Popen(
+            [exe_path],
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+    except Exception:
+        return None
+    # 轮询等待 CAD COM 注册完成
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            gc = win32com.client.GetActiveObject(progid)
+            return gc
+        except Exception:
+            continue
+    return None
+
+
+def _check_runasadmin(exe_path):
+    """检查 CAD exe 是否被设为"始终以管理员身份运行"（兼容性标志）。
+
+    这是非管理员 Python 无法连接 CAD 的最常见原因：
+    HKCU\\...\\AppCompatFlags\\Layers\\<exe_path> = "RUNASADMIN"
+    设置后 CAD 以高完整性级别运行，COM 对象注册在高级别 ROT，
+    非管理员进程无法通过 GetActiveObject 访问。
+    """
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers")
+        val = winreg.QueryValueEx(key, exe_path)
+        winreg.CloseKey(key)
+        return "RUNASADMIN" in str(val[0]).upper()
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
+# 进程检测缓存：同一 exe 名只跑一次 tasklist（多版本 ProgID 常指向同一 exe）
+_proc_running_cache: dict[str, bool] = {}
+
+
+def _is_cad_process_running(exe_path):
+    """检查 CAD exe 是否有进程在运行（通过 tasklist）。
+
+    当 GetActiveObject 失败但进程在运行时，通常意味着：
+    1. CAD 以管理员身份运行（ROT 隔离），或
+    2. CAD 尚未完成初始化（无打开的图纸）。
+
+    带模块级缓存：本机 2020/2022 的 exe 都叫 acad.exe，多个版本化 ProgID
+    会重复查询同一个进程名——缓存避免每次连接重复跑 tasklist（约 0.3s/次）。
+    """
+    exe_name = os.path.basename(exe_path).lower()
+    if exe_name in _proc_running_cache:
+        return _proc_running_cache[exe_name]
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {exe_name}"],
+            capture_output=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            encoding="gbk", errors="replace",
+        )
+        running = exe_name in result.stdout.lower()
+    except Exception:
+        running = False
+    _proc_running_cache[exe_name] = running
+    return running
+
+
+def _collect_connect_diag(progids):
+    """全部连接失败后收集场景诊断信息（每 exe 仅一次 tasklist，含缓存）。
+
+    仅在所有 ProgID 都失败时调用——连接成功路径不触发任何慢速探测
+    （tasklist/注册表扫描），保证已运行实例场景下秒连。
+    """
+    diag = []
+    for progid in progids:
+        exe_path = _get_cad_exe_path(progid)
+        is_admin = _check_runasadmin(exe_path) if exe_path else False
+        is_running = _is_cad_process_running(exe_path) if exe_path else False
+        diag.append((progid, exe_path, is_admin, is_running))
+    return diag
+
+
+def _is_running_as_admin():
+    """检查当前 Python 进程是否以管理员身份运行。"""
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _try_auto_elevate():
+    """以管理员身份重启当前脚本（弹出 UAC 确认框）。
+
+    使用 ShellExecuteW + "runas" 动词，用户确认后新进程以管理员权限运行，
+    当前进程退出。如果用户拒绝 UAC 或调用失败，返回 False。
+
+    使用场景：AutoCAD 以管理员身份运行，但 Python 脚本不是——
+    COM 的完整性级别隔离导致 GetActiveObject 无法连接。
+    提权后双方处于同一高级别，连接恢复正常。
+    """
+    try:
+        import ctypes
+        import sys
+
+        params = " ".join(f'"{a}"' for a in sys.argv)
+        # SW_SHOWNORMAL = 1
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, params, None, 1
+        )
+        # ShellExecuteW 返回值 > 32 表示成功
+        if result > 32:
+            return True
+        return False
+    except Exception:
+        return False
 
 
 def _win32():
@@ -88,8 +437,11 @@ def _detect_cad_windows():
     """
     win32com, _, win32gui, _ = _win32()
     results = []
-    for label, progids in [("gstar", _CAD_PROGIDS["gstar"]),
-                            ("autocad", _CAD_PROGIDS["autocad"])]:
+    for label, progids in [
+        ("gstar", _list_cad_progids("GCAD.Application")
+         + _list_cad_progids("GstarCAD.Application")),
+        ("autocad", _list_cad_progids("AutoCAD.Application")),
+    ]:
         for progid in progids:
             try:
                 gc = win32com.client.GetActiveObject(progid)
@@ -138,7 +490,11 @@ def foreground_cad_prefer(self_hwnd=None):
 def get_gcad(prefer=None):
     """连接 CAD（AutoCAD 或 GstarCAD），返回 (gc, doc, ms, app_name)。
 
-    优先连已运行的实例（GetActiveObject），否则启动对应程序（Dispatch）。
+    优先连已运行的实例（GetActiveObject），否则尝试启动程序（Dispatch）。
+    当 Dispatch 因 UAC 提权失败时，回退到 subprocess 直接启动 CAD 进程，
+    再用 GetActiveObject 连接——这是非管理员环境下最常见的连接失败场景。
+    连接成功但无打开图纸时自动新建一个。
+
     prefer:
       - None (自动)：先检测正在运行的 CAD 实例——
         * 只有一个在跑 → 精准连它（避免 CLI 场景下 AutoCAD 优先却把
@@ -148,41 +504,178 @@ def get_gcad(prefer=None):
         绝不悄悄连到另一种 CAD（否则会出现"选了 GstarCAD 却连上 AutoCAD"）。
     """
     win32com, _, _, _ = _win32()
+    # 动态枚举 ProgID（含版本化项），覆盖多版本 AutoCAD 共存场景：
+    # 无版本别名只指向最后注册的版本，用户开着旧版实例时必须用
+    # AutoCAD.Application.23 等版本化 ProgID 才能 GetActiveObject 到。
+    _autocad = _list_cad_progids("AutoCAD.Application") or list(_CAD_PROGIDS["autocad"])
+    _gstar = (_list_cad_progids("GCAD.Application")
+              + _list_cad_progids("GstarCAD.Application")) or list(_CAD_PROGIDS["gstar"])
     if prefer == "autocad":
-        progids = list(_CAD_PROGIDS["autocad"])
+        progids = _autocad
     elif prefer == "gstar":
-        progids = list(_CAD_PROGIDS["gstar"])
+        progids = _gstar
     else:  # 自动：先探测运行实例，单实例精准连
         try:
             running = _detect_cad_windows()
             if len(running) == 1:
-                progids = _CAD_PROGIDS[running[0][0]]
+                progids = _autocad if running[0][0] == "autocad" else _gstar
             else:
-                progids = _CAD_PROGIDS["autocad"] + _CAD_PROGIDS["gstar"]
+                progids = _autocad + _gstar
         except Exception:
-            progids = _CAD_PROGIDS["autocad"] + _CAD_PROGIDS["gstar"]
+            progids = _autocad + _gstar
+
+    # 每次连接前清空进程检测缓存，避免进程状态过期
+    _proc_running_cache.clear()
+
     last_err = None
+
+    # 阶段 1：GetActiveObject 遍历全部 ProgID，优先连「已运行的实例」。
+    # ⚠️ 绝不能逐 ProgID「先 GetActiveObject 再 Dispatch」：无版本别名
+    # AutoCAD.Application 只指向最后注册版本(2022)，用户开着旧版(2020)时
+    # 其 GetActiveObject 失败会立刻 Dispatch 冷启动 2022（等 20 秒且连错版本），
+    # 根本轮不到 .23.1 去命中已运行的 2020。必须先找全运行实例，再考虑启动。
+    gc = None
     for progid in progids:
-        gc = None
         try:
-            gc = win32com.client.GetActiveObject(progid)  # 先连已运行的实例
+            gc = win32com.client.GetActiveObject(progid)
+            break
         except Exception as e:
             last_err = e
-        if gc is None:
+            gc = None
+
+    # 阶段 2：没有任何运行实例 → 按版本新→旧 Dispatch 启动
+    if gc is None:
+        for progid in progids:
             try:
-                gc = win32com.client.Dispatch(progid)  # 否则启动程序
+                gc = win32com.client.Dispatch(progid)
+                break
             except Exception as e:
                 last_err = e
-                continue
+                # Dispatch 因 UAC 提权失败 → 回退到 subprocess 直接启动
+                if _is_elevation_error(e):
+                    gc = _launch_cad_and_connect(progid)
+                    if gc is not None:
+                        break
+
+    if gc is not None:
         try:
             gc.Visible = True
             doc = gc.ActiveDocument
             ms = doc.ModelSpace
-            return gc, doc, ms, _CAD_LABELS.get(progid, progid)
+            return gc, doc, ms, _cad_label(progid)
         except Exception as e:
             last_err = e
-            continue
-    raise RuntimeError(f"无法连接 CAD（{prefer or '自动'}）：{last_err}")
+            # CAD 已连接但无打开图纸 → 尝试新建一个
+            try:
+                doc = gc.Documents.Add()
+                ms = doc.ModelSpace
+                return gc, doc, ms, _cad_label(progid)
+            except Exception:
+                # 新建失败 → 记录"需要打开图纸"的诊断
+                label = _cad_label(progid)
+                last_err = RuntimeError(
+                    f'{label} 已连接但无打开图纸，请在 CAD 中新建或打开图纸。')
+                gc = None
+
+    # 所有 ProgID 都失败 → 收集场景诊断（仅失败路径，tasklist 有缓存）
+    diag = _collect_connect_diag(progids)
+    err_type, err_tip = _classify_com_error(last_err)
+    detail = f"{last_err}" if last_err else "未知错误"
+    parts = [f"{err_type}：{detail}", err_tip]
+    if err_type != "CAD 未注册":
+        # 权限/服务器等场景：附加 RUNASADMIN / 无图纸 / 未运行 的场景诊断
+        parts.append(_build_connect_error(prefer, last_err, diag))
+    else:
+        # 类未注册场景：附加注册表扫描结果
+        parts.append(diagnose_cad_connection(prefer))
+    raise RuntimeError("\n\n".join(parts))
+
+
+def _build_connect_error(prefer, last_err, diag):
+    """根据诊断信息生成精确的连接失败错误消息。"""
+    lines = [f'无法连接 CAD（{prefer or "自动"}）：{last_err}']
+
+    for progid, exe_path, is_admin, is_running in diag:
+        label = _cad_label(progid)
+        if is_admin and is_running:
+            lines.append(
+                f'\n⚠ {label} 正以管理员身份运行，导致 COM 连接被隔离。\n'
+                '  解决方法（任选其一）：\n'
+                '  1. 关闭 CAD，右键 CAD 快捷方式 → 属性 → 兼容性 →\n'
+                '     取消勾选「以管理员身份运行此程序」，然后重新启动 CAD；\n'
+                '  2. 以管理员身份运行本程序（右键 → 以管理员身份运行）。'
+            )
+        elif is_admin and not is_running:
+            lines.append(
+                f'\n⚠ {label} 被设为「始终以管理员身份运行」（RUNASADMIN）。\n'
+                '  非管理员进程无法通过 COM 启动它。\n'
+                '  解决方法：右键 CAD 快捷方式 → 属性 → 兼容性 →\n'
+                '     取消勾选「以管理员身份运行此程序」。'
+            )
+        elif is_running and not is_admin:
+            lines.append(
+                f'\n⚠ {label} 进程在运行但 COM 连接失败。\n'
+                '  可能原因：CAD 尚未打开图纸（停在启动页），\n'
+                '  请在 CAD 中新建或打开一个图纸后重试。'
+            )
+        else:
+            lines.append(
+                f'\n⚠ {label} 未运行且无法自动启动。\n'
+                '  请手动启动 CAD 并打开一个图纸后重试。'
+            )
+
+    return '\n'.join(lines)
+
+
+def get_gcad_or_elevate(prefer=None):
+    """连接 CAD，检测到管理员权限不匹配时自动提权重启。
+
+    流程：
+      1. 先尝试 get_gcad(prefer) 连接
+      2. 如果失败且错误与管理员权限有关（AutoCAD 以管理员运行但脚本不是）：
+         a. 当前不是管理员 → 调用 _try_auto_elevate() 弹 UAC 确认
+            - 用户同意 → 新管理员进程启动，当前进程退出
+            - 用户拒绝 → 抛出原始错误
+         b. 当前已是管理员 → 直接抛出错误（提权也解决不了）
+      3. 其他错误直接抛出
+
+    这样用户只需保持 AutoCAD 以管理员运行，脚本会自动弹 UAC 提权，
+    不需要手动右键"以管理员身份运行"。
+    """
+    try:
+        return get_gcad(prefer)
+    except RuntimeError as e:
+        err_msg = str(e)
+        # 检测是否是管理员权限不匹配导致的连接失败（两种场景）：
+        #   1. CAD 以管理员运行但脚本不是 → "COM 连接被隔离"
+        #   2. CAD 设为 RUNASADMIN 但未运行 → "非管理员进程无法通过 COM 启动"
+        is_admin_mismatch = (
+            ('管理员身份运行' in err_msg and 'COM 连接被隔离' in err_msg)
+            or ('RUNASADMIN' in err_msg and '非管理员进程无法通过 COM 启动' in err_msg)
+        )
+        if not is_admin_mismatch:
+            raise  # 非权限问题，直接抛出
+
+        if _is_running_as_admin():
+            raise  # 已经是管理员了还连不上，问题在别处
+
+        # 尝试自动提权
+        print(
+            '⚠ 检测到 CAD 需要管理员权限，正在请求提权\n'
+            '  （请点击 UAC 确认框中的"是"）…',
+            flush=True,
+        )
+        if _try_auto_elevate():
+            # UAC 确认成功，新管理员进程已启动，当前进程退出
+            import sys
+            sys.exit(0)
+        else:
+            # 用户拒绝了 UAC 或提权失败
+            raise RuntimeError(
+                f'{err_msg}\n\n'
+                '  自动提权被取消。请手动以管理员身份运行本程序：\n'
+                '  右键终端/IDE → 以管理员身份运行，然后重新执行命令。'
+            ) from e
 
 
 def ensure_layer(doc, name, color=None):

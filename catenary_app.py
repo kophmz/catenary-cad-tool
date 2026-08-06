@@ -60,7 +60,9 @@ from catenary_core import (
 from catenary_cad import (
     # 连接
     get_gcad,
+    get_gcad_or_elevate,
     foreground_cad_prefer,
+    diagnose_cad_connection,
     # 图层
     ensure_layer,
     # 交互
@@ -100,7 +102,7 @@ def _help_path():
 class CatenaryApp:
     def __init__(self, root):
         self.root = root
-        root.title("空间弧垂曲线工具 · CAD · v0.21")
+        root.title("空间弧垂曲线工具 · CAD · v0.22")
         root.geometry("700x900")
         root.resizable(False, False)
 
@@ -128,6 +130,7 @@ class CatenaryApp:
             sel, self.cad_prefer_var, "自动", "自动", "GstarCAD", "AutoCAD"
         ).pack(side="left")
         ttk.Button(f0, text="使用说明", command=self.open_help).pack(side="right", padx=(0,4))
+        ttk.Button(f0, text="诊断 CAD", command=self.diagnose).pack(side="right", padx=(0,4))
         ttk.Button(f0, text="连接/刷新 CAD窗口", command=self.connect).pack(side="right")
 
         # 模块 1：生成弧垂曲线（支持 K 值 / 应力σ₀+比载γ 两种输入）
@@ -321,8 +324,42 @@ class CatenaryApp:
             self.log_msg(f"✔ 已连接 {app} {self.doc.Name}（目标={self.cad_prefer_var.get()}）")
         except Exception as e:
             self.status_var.set("连接失败")
-            messagebox.showerror("连接失败", f"无法连接 CAD（{self.cad_prefer_var.get()}）：\n{e}")
+            err_msg = str(e)
             self.log_msg(f"✘ 连接失败: {e}")
+            # 检测管理员权限不匹配 → 询问是否提权重启
+            # （get_gcad 已把 HRESULT 转成中文分类 + 场景化诊断）
+            if (('管理员身份运行' in err_msg and 'COM 连接被隔离' in err_msg)
+                    or ('RUNASADMIN' in err_msg
+                        and '非管理员进程无法通过 COM 启动' in err_msg)):
+                from catenary_cad import _is_running_as_admin, _try_auto_elevate
+                if not _is_running_as_admin():
+                    if messagebox.askyesno(
+                        "需要管理员权限",
+                        "检测到 CAD 正以管理员身份运行，导致 COM 连接被隔离。\n\n"
+                        "是否以管理员身份重启本程序？\n"
+                        '（点击"是"后会弹出 UAC 确认框）',
+                    ):
+                        if _try_auto_elevate():
+                            self.root.destroy()
+                            return
+                messagebox.showerror(
+                    "连接失败",
+                    f"无法连接 CAD（{self.cad_prefer_var.get()}）：\n{e}\n\n"
+                    "提示：请手动以管理员身份运行本程序，"
+                    '或关闭 CAD 后取消其"以管理员身份运行"设置。',
+                )
+            else:
+                # 其他错误：get_gcad 已含分类与诊断，直接展示
+                messagebox.showerror(
+                    "连接失败",
+                    f"无法连接 CAD（{self.cad_prefer_var.get()}）：\n\n{e}",
+                )
+
+    def diagnose(self):
+        """弹出本机 CAD COM 注册诊断结果，帮助用户自助排查。"""
+        report = diagnose_cad_connection()
+        messagebox.showinfo("CAD 连接诊断", report)
+        self.log_msg("ℹ CAD 诊断信息已显示")
 
     # ---- 模块1 ------------------------------------------------------
     def _on_gen_mode_change(self, mode):
@@ -651,7 +688,7 @@ def main():
 # ───────────────────────────────────────────────────────────────────
 
 def _cli_draw(args):
-    gc, doc, ms, _app = get_gcad(getattr(args, "cad", None))
+    gc, doc, ms, _app = get_gcad_or_elevate(getattr(args, "cad", None))
     if args.pick:
         print("→ 在 CAD 中点选第1个悬挂点 …", flush=True)
         p1 = pick_point(doc, "\n选择第1个悬挂点: ")
@@ -685,7 +722,7 @@ def _cli_draw(args):
 
 
 def _cli_mindist(args):
-    gc, doc, ms, _app = get_gcad(getattr(args, "cad", None))
+    gc, doc, ms, _app = get_gcad_or_elevate(getattr(args, "cad", None))
     if args.pick:
         print("→ 在 CAD 中点选第1条曲线 …", flush=True)
         e1 = pick_entity(doc, "\n选择第1条曲线: ", _app)
@@ -706,7 +743,7 @@ def _cli_mindist(args):
 
 
 def _cli_wind(args):
-    gc, doc, ms, _app = get_gcad(getattr(args, "cad", None))
+    gc, doc, ms, _app = get_gcad_or_elevate(getattr(args, "cad", None))
     if args.handle:
         ent = get_entity_by_handle(ms, args.handle)
         print(f"→ 已按句柄 {args.handle} 定位曲线")
@@ -729,7 +766,7 @@ def _cli_wind(args):
 
 
 def _cli_bundle(args):
-    gc, doc, ms, _app = get_gcad(getattr(args, "cad", None))
+    gc, doc, ms, _app = get_gcad_or_elevate(getattr(args, "cad", None))
     if args.handle:
         ent = get_entity_by_handle(ms, args.handle)
         print(f"→ 已按句柄 {args.handle} 定位中心线")
@@ -754,7 +791,7 @@ def _cli_bundle(args):
 
 
 def _cli_suspension(args):
-    gc, doc, ms, _app = get_gcad(getattr(args, "cad", None))
+    gc, doc, ms, _app = get_gcad_or_elevate(getattr(args, "cad", None))
     if args.pick:
         print("→ 在 CAD 中点选第1个悬挂点 …", flush=True)
         p1 = pick_point(doc, "\n选择第1个悬挂点: ")
@@ -879,33 +916,46 @@ def cli_main():
     s.add_argument("--wind", action="store_true", help="绘制风偏线")
     s.add_argument("--b", type=float, default=0.0, help="线风偏角B(°)，右偏为正")
 
+    sub.add_parser("check", parents=[parent], help="检查本机 CAD COM 注册状态")
+
     args = parser.parse_args()
-    if args.cmd == "draw":
-        if not args.pick and (not args.p1 or not args.p2):
-            parser.error("draw 需 --pick 或同时提供 --p1 --p2")
-        _cli_draw(args)
-    elif args.cmd == "mindist":
-        if not args.pick and (not args.h1 or not args.h2):
-            parser.error("mindist 需 --pick 或同时提供 --h1 --h2")
-        _cli_mindist(args)
-    elif args.cmd == "wind":
-        if not args.pick and not args.handle:
-            parser.error("wind 需 --pick 或 --handle")
-        _cli_wind(args)
-    elif args.cmd == "bundle":
-        if not args.pick and not args.handle:
-            parser.error("bundle 需 --pick 或 --handle")
-        _cli_bundle(args)
-    elif args.cmd == "suspension":
-        if not args.pick and (not args.p1 or not args.p2):
-            parser.error("suspension 需 --pick 或同时提供 --p1 --p2")
-        _cli_suspension(args)
-    else:
-        parser.print_help()
+    try:
+        if args.cmd == "check":
+            print(diagnose_cad_connection(args.cad))
+            return
+        if args.cmd == "draw":
+            if not args.pick and (not args.p1 or not args.p2):
+                parser.error("draw 需 --pick 或同时提供 --p1 --p2")
+            _cli_draw(args)
+        elif args.cmd == "mindist":
+            if not args.pick and (not args.h1 or not args.h2):
+                parser.error("mindist 需 --pick 或同时提供 --h1 --h2")
+            _cli_mindist(args)
+        elif args.cmd == "wind":
+            if not args.pick and not args.handle:
+                parser.error("wind 需 --pick 或 --handle")
+            _cli_wind(args)
+        elif args.cmd == "bundle":
+            if not args.pick and not args.handle:
+                parser.error("bundle 需 --pick 或 --handle")
+            _cli_bundle(args)
+        elif args.cmd == "suspension":
+            if not args.pick and (not args.p1 or not args.p2):
+                parser.error("suspension 需 --pick 或同时提供 --p1 --p2")
+            _cli_suspension(args)
+        else:
+            parser.print_help()
+    except RuntimeError as e:
+        # get_gcad 已经把 HRESULT 转成中文说明并附带诊断
+        print(f"错误：{e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"未预期的错误：{e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ("draw", "mindist", "wind", "bundle", "suspension"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("draw", "mindist", "wind", "bundle", "suspension", "check"):
         cli_main()
     else:
         main()

@@ -26,7 +26,7 @@
 <body>
 
 <h1>空间弧垂曲线工具</h1>
-<p>作者：Mz | 版本：0.21 | 适用 CAD：GstarCAD / AutoCAD | 项目地址：<a href="https://github.com/kophmz/catenary-cad-tool" target="_blank">GitHub</a></p>
+<p>作者：Mz | 版本：0.22 | 适用 CAD：GstarCAD / AutoCAD | 项目地址：<a href="https://github.com/kophmz/catenary-cad-tool" target="_blank">GitHub</a></p>
 
 <h2>一、软件简介</h2>
 <p>本工具用于在 AutoCAD 或 GstarCAD 中快速生成<strong>三维空间悬链线（弧垂曲线）</strong>，并支持两曲线最小距离测量、风偏弧垂曲线、分裂导线与含悬垂绝缘子串的弧垂线绘制。核心计算基于《电力工程设计手册 架空输电线路设计》式14-1 悬链线方程，K 值直接取用物理值，无需换算。</p>
@@ -43,7 +43,7 @@
 <h2>二、环境要求</h2>
 <ul>
   <li><strong>操作系统</strong>：Windows 10 / 11（64 位）</li>
-  <li><strong>CAD 软件</strong>：AutoCAD 或 GstarCAD（浩辰 CAD），须已启动并打开图纸；64 位版本，不支持 AutoCAD LT</li>
+  <li><strong>CAD 软件</strong>：AutoCAD 或 GstarCAD（浩辰 CAD），64 位版本，不支持 AutoCAD LT；支持一台机器安装多个版本并存（如 AutoCAD 2020 + 2022）</li>
   <li><strong>运行方式</strong>：<strong>无需安装 Python</strong>——GUI 双击 <code>空间弧垂曲线工具.exe</code>；命令行用 <code>空间弧垂曲线工具CLI.exe</code>。也可用 Python 3.12 + pywin32 跑源码 <code>catenary_app.py</code></li>
 </ul>
 
@@ -71,7 +71,9 @@
 <ul>
   <li><strong>目标下拉</strong>：自动 / GstarCAD / AutoCAD。选择「自动」时程序会识别你当前正在操作的 CAD 窗口。</li>
   <li>点击「连接/刷新 CAD窗口」，状态栏显示连接结果（如「已连接 AutoCAD Drawing1」）。</li>
-  <li>CAD 必须已启动并打开了图纸，否则连接失败。</li>
+  <li><strong>多版本自动识别</strong>：工具会自动枚举本机所有版本的 AutoCAD / GstarCAD（如 2020 + 2022 并存），<strong>优先连接已运行的实例（秒级响应）</strong>，全部未开启才自动启动最新版本。</li>
+  <li>CAD 必须已启动并打开了图纸，否则连接失败；已连接但无图纸时工具会自动新建一张。</li>
+  <li>若连接失败，可点击「诊断 CAD」查看本机注册状态；或在 CLI 运行 <code>空间弧垂曲线工具CLI.exe check</code>。</li>
 </ul>
 <div class="tip">💡 如果同时开着 AutoCAD 和 GstarCAD，选「自动」会连你刚在操作的那个；也可直接在下拉中指定。</div>
 
@@ -155,7 +157,13 @@
 <h2>七、常见问题</h2>
 
 <h3>Q: 连接失败 / 无法连接 CAD</h3>
-<p>确保 CAD 已启动并打开了一张图纸。在 GUI 中确认「目标」下拉选对了 CAD 或「自动」。两个 CAD 同时开时建议用「自动」或手动指定。</p>
+<p>先点击「诊断 CAD」按钮（或运行 <code>空间弧垂曲线工具CLI.exe check</code>）查看本机 COM 注册状态：</p>
+<ul>
+  <li><strong>提示"CAD 未注册 / 无效的类字符串"（-2147221005）</strong>：本机注册表里没有 AutoCAD / GstarCAD 的 COM 项。常见原因：未安装 CAD、绿色版未注册、或用了 32 位 Python。请确认 CAD 已完整安装；已安装但仍报错时，用 64 位 Python 运行。</li>
+  <li><strong>提示"需要管理员权限"（-2147024156）</strong>：CAD 与工具的进程权限不一致（通常 CAD 以管理员运行而工具没有）。本版本会自动检测并处理：GUI 弹窗询问是否以管理员身份重启，CLI 自动弹 UAC 提权；若提权被拒绝，也可手动右键 exe →“以管理员身份运行”，或右键 CAD 快捷方式 → 属性 → 兼容性 → 取消勾选「以管理员身份运行此程序」后重启 CAD。</li>
+  <li><strong>装了两个 AutoCAD 版本（如 2020 + 2022），连接慢或连不上</strong>：v0.22 已支持多版本共存，自动枚举所有版本并<strong>优先连接已运行的实例</strong>（秒级响应，不会误启动另一个版本）。请确认使用 v0.22 及以上版本。</li>
+  <li><strong>其他情况</strong>：确保 CAD 已启动并打开图纸；在 GUI 中确认「目标」下拉选对了 CAD 或「自动」。两个 CAD 同时开时建议用「自动」或手动指定。</li>
+</ul>
 
 <h3>Q: 点选时没反应 / 报错</h3>
 <p>点选操作是在 CAD 的命令行进行的，不是在 Python 窗口。程序会最小化 GUI 窗口，此时应在 CAD 中操作。若误点取消（ESC），程序会提示"已取消"。</p>

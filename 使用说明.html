@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>空间弧垂曲线工具 — 使用说明</title>
+<style>
+  body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; color: #333; line-height: 1.8; }
+  h1 { border-bottom: 3px solid #2c7be5; padding-bottom: 10px; color: #2c7be5; }
+  h2 { color: #444; border-bottom: 1px solid #ddd; padding-bottom: 6px; margin-top: 32px; }
+  h3 { color: #555; margin-top: 20px; }
+  kbd { background: #eee; border: 1px solid #ccc; border-radius: 3px; padding: 1px 6px; font-size: 0.9em; }
+  code { background: #f0f0f0; padding: 2px 5px; border-radius: 2px; font-size: 0.92em; }
+  pre { background: #f7f7f7; border: 1px solid #ddd; border-radius: 4px; padding: 12px 16px; overflow-x: auto; font-size: 0.9em; }
+  ul, ol { padding-left: 24px; }
+  li { margin: 4px 0; }
+  .tip { background: #e8f5e9; border-left: 4px solid #4caf50; padding: 10px 16px; margin: 16px 0; border-radius: 2px; }
+  .warn { background: #fff3e0; border-left: 4px solid #ff9800; padding: 10px 16px; margin: 16px 0; border-radius: 2px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+  th { background: #f5f5f5; }
+  a { color: #2c7be5; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h1>空间弧垂曲线工具</h1>
+<p>作者：Mz | 版本：0.21 | 适用 CAD：GstarCAD / AutoCAD | 项目地址：<a href="https://github.com/kophmz/catenary-cad-tool" target="_blank">GitHub</a></p>
+
+<h2>一、软件简介</h2>
+<p>本工具用于在 AutoCAD 或 GstarCAD 中快速生成<strong>三维空间悬链线（弧垂曲线）</strong>，并支持两曲线最小距离测量、风偏弧垂曲线、分裂导线与含悬垂绝缘子串的弧垂线绘制。核心计算基于《电力工程设计手册 架空输电线路设计》式14-1 悬链线方程，K 值直接取用物理值，无需换算。</p>
+
+<p>支持功能：</p>
+<ol>
+  <li><strong>生成空间弧垂曲线</strong> — 拾取两个悬挂点，输入 K 值，在两点间生成真三维弧垂曲线。</li>
+  <li><strong>两条曲线最小距离</strong> — 拾取两条 CAD 曲线，计算并绘制最小距离连线与数值标注。</li>
+  <li><strong>风偏弧垂曲线</strong> — 选一条弧垂曲线，输入风偏角，生成绕端点连线旋转的蓝色风偏曲线。</li>
+  <li><strong>分裂导线</strong> — 以一条弧垂曲线为中心线，按间距生成双分裂（水平/垂直）或四分裂子导线。</li>
+  <li><strong>含悬垂串弧垂线</strong> — 悬挂点可设置悬垂绝缘子串（长度、风偏角），支持带风偏的完整弧垂建模。</li>
+</ol>
+
+<h2>二、环境要求</h2>
+<ul>
+  <li><strong>操作系统</strong>：Windows 10 / 11（64 位）</li>
+  <li><strong>CAD 软件</strong>：AutoCAD 或 GstarCAD（浩辰 CAD），须已启动并打开图纸；64 位版本，不支持 AutoCAD LT</li>
+  <li><strong>运行方式</strong>：<strong>无需安装 Python</strong>——GUI 双击 <code>空间弧垂曲线工具.exe</code>；命令行用 <code>空间弧垂曲线工具CLI.exe</code>。也可用 Python 3.12 + pywin32 跑源码 <code>catenary_app.py</code></li>
+</ul>
+
+<h2>三、启动方式</h2>
+<h3>方式一：GUI 图形界面（推荐）</h3>
+<p>双击 <code>空间弧垂曲线工具.exe</code> 直接运行（免 Python 环境）。源码运行：双击 <code>catenary_app.py</code>（或用 <code>pythonw catenary_app.py</code> 启动，无控制台窗口），弹出操作窗口。</p>
+
+<h3>方式二：命令行模式</h3>
+<p>用 <code>空间弧垂曲线工具CLI.exe</code>（console 版，有控制台输出，跑完正常退出；GUI 版 exe 不提供命令行模式）。也可用源码 <code>python catenary_app.py</code>，效果相同。无参数运行会打印用法帮助。</p>
+<pre>空间弧垂曲线工具CLI.exe draw --K 15.22 --pick     # 交互拾取两点生成弧垂
+空间弧垂曲线工具CLI.exe draw --K 15.22 --p1 0 0 0 --p2 100 30 12   # 直接给坐标
+空间弧垂曲线工具CLI.exe mindist --pick            # 交互选两条曲线测距
+空间弧垂曲线工具CLI.exe wind --handle E90 --angle 30.6  # 按句柄生成风偏
+空间弧垂曲线工具CLI.exe bundle --pick --d 600 --mode quad   # 四分裂 600mm
+空间弧垂曲线工具CLI.exe suspension --K 15.22 --pick --s1 --d1 3 --s2 --d2 4 --wind --b 20  # 含悬垂串+风偏</pre>
+<div class="tip">💡 在 Windows 控制台（GBK 编码）下，输出中的 ✔ ✘ 等符号会显示为 <code>?</code>，属正常容错表现，不影响结果。</div>
+
+<h2>四、角度正负约定（重要）</h2>
+<div class="tip">💡 <strong>所有角度（风偏角、串角 A、线偏角 B）统一约定</strong>：右偏为正（+）、左偏为负（−）。"左右"以点选先后顺序为前进方向——<strong>面向第 1 点→第 2 点方向观察</strong>，右手边即为"右"。</div>
+
+<h2>五、GUI 功能详解</h2>
+
+<h3>连接 CAD</h3>
+<p>启动后首先需要连接 CAD：</p>
+<ul>
+  <li><strong>目标下拉</strong>：自动 / GstarCAD / AutoCAD。选择「自动」时程序会识别你当前正在操作的 CAD 窗口。</li>
+  <li>点击「连接/刷新 CAD窗口」，状态栏显示连接结果（如「已连接 AutoCAD Drawing1」）。</li>
+  <li>CAD 必须已启动并打开了图纸，否则连接失败。</li>
+</ul>
+<div class="tip">💡 如果同时开着 AutoCAD 和 GstarCAD，选「自动」会连你刚在操作的那个；也可直接在下拉中指定。</div>
+
+<h3>① 生成空间弧垂曲线</h3>
+<p>「输入方式」下拉提供两种等价选项，按需选择：</p>
+<table>
+  <tr><th>选项</th><th>输入</th><th>说明</th></tr>
+  <tr><td><code>K值</code></td><td>K（省略 10⁻⁵）</td><td>直接填 K，如 15.22</td></tr>
+  <tr><td><code>应力+比载</code></td><td>σ₀(N/mm²) + γ(N/(m·mm²))</td><td>程序内部换算 K=γ/(8σ₀)</td></tr>
+</table>
+<p class="tip">两种输入方式均用同一算法：悬链线方程 y = a·cosh((x−x₀)/a) + y₀（a = 1/(8K)），不等高时用牛顿迭代精确求解最低点偏移 x₀。</p>
+<ol>
+  <li>选择输入方式并填入参数，以及采样点数。</li>
+  <li>点击「拾取两点并生成」— 窗口自动最小化，切换到 CAD。</li>
+  <li>在 CAD 命令行/十字光标下依次点选两个悬挂点（三维点）。</li>
+  <li>窗口恢复，曲线已生成（图层"悬链线"，红色）。</li>
+</ol>
+
+<div class="warn">⚠️ 弧垂方向为 Z 轴（竖直方向）。确保在 CAD 中 Z 轴指向天空。</div>
+
+<h3>② 两条曲线最小距离</h3>
+<ol>
+  <li>点击「依次拾取两条曲线」→ 窗口最小化。</li>
+  <li>在 CAD 中依次点选第一条曲线、第二条曲线（支持直线/圆弧/圆/多段线/样条曲线）。</li>
+  <li>程序自动计算并绘制绿色最小距离连线，标注实测距离值。</li>
+</ol>
+
+<h3>③ 风偏弧垂曲线</h3>
+<ol>
+  <li>输入风偏角（度，右偏为正、左偏为负，见"四、角度正负约定"）。</li>
+  <li>点击「拾取曲线并生成」→ 窗口最小化。</li>
+  <li>在 CAD 中点选一条已生成的弧垂曲线。</li>
+  <li>生成蓝色风偏曲线（图层"风偏弧垂曲线"），原曲线保持不变。</li>
+</ol>
+<p>风偏曲线是原曲线绕<strong>首尾端点连线</strong>旋转指定角度而成。标签显示「风偏X°」，均为绝对值（忽略输入正负号）。</p>
+
+<h3>④ 分裂导线</h3>
+<ol>
+  <li>输入<strong>分裂间距（单位 mm）</strong>，如 600 表示图上 0.6m。</li>
+  <li>选择模式：水平双分裂 / 垂直双分裂 / 四分裂。</li>
+  <li>点击「拾取中心线并生成」→ 在 CAD 中点选一条弧垂曲线（可为风偏后的曲线）。</li>
+  <li>生成黄色子导线（图层"分裂导线"），中心线保持不变。</li>
+</ol>
+<p><strong>几何原理</strong>：分裂方向基于"弦平面局部坐标系"——水平分裂沿平面法线 n、垂直分裂沿平面内垂直弦方向 v、四分裂为两者四角组合。风偏后的倾斜曲线同样适用，子导线处处与中心线平行、间距恒为 d。</p>
+
+<h3>⑤ 含悬垂串弧垂线</h3>
+<p>「输入方式」与模块①一致，两种等价选项：<code>K值</code>（K 省略 10⁻⁵）/ <code>应力+比载</code>（σ₀ + γ，程序算 K=γ/(8σ₀)），均用同一悬链线算法（cosh + 牛顿迭代）。</p>
+<ol>
+  <li>选择输入方式并填入参数、采样点数。</li>
+  <li>勾选「点1悬垂串」「点2悬垂串」，输入各自<strong>串长 D（单位 m）</strong>；不勾选则该点为普通悬挂点。</li>
+  <li><strong>未勾选「绘制风偏线」</strong>：串角按 0（竖直串），画品红悬垂串 + 红色基准弧垂线。</li>
+  <li><strong>勾选「绘制风偏线」</strong>：输入线偏角 B(°)、串角 A1/A2(°)（右偏为正）：
+    <ul>
+      <li>悬垂串按 A 摇摆 → 绘制<strong>浅蓝色摆串</strong>（图层"悬垂串风偏"）；</li>
+      <li>直接绘制<strong>蓝色风偏线</strong>（以摆串下端为端点）；</li>
+      <li>不再绘制未风偏的参照曲线与参照绝缘子（只画风偏相关元素）。</li>
+    </ul>
+  </li>
+  <li>点击「拾取两点并生成」→ 在 CAD 中依次点选两个悬挂点（顺序 = 前进方向）。</li>
+</ol>
+
+<h2>六、命令行参数速查</h2>
+<table>
+  <tr><th>参数</th><th>说明</th><th>示例</th></tr>
+  <tr><td><code>--K</code></td><td>K 值（省略 10⁻⁵）</td><td><code>--K 15.22</code></td></tr>
+  <tr><td><code>--sigma / --gamma</code></td><td>导线应力 σ₀(N/mm²) / 比载 γ(N/(m·mm²))，与 --K 二选一（K=γ/(8σ₀)）</td><td><code>--sigma 50 --gamma 0.06088</code></td></tr>
+  <tr><td><code>--n</code></td><td>采样点数，默认 200</td><td><code>--n 500</code></td></tr>
+  <tr><td><code>--p1 / --p2</code></td><td>悬挂点坐标 x y z</td><td><code>--p1 0 0 0 --p2 100 30 12</code></td></tr>
+  <tr><td><code>--pick</code></td><td>交互拾取（CAD 中点选）</td><td><code>--pick</code></td></tr>
+  <tr><td><code>--handle</code></td><td>按句柄指定图元（16 进制）</td><td><code>--handle E90</code></td></tr>
+  <tr><td><code>--angle</code></td><td>风偏角（度，右偏为正）</td><td><code>--angle 30.6</code></td></tr>
+  <tr><td><code>--d</code></td><td>分裂间距（mm）</td><td><code>--d 600</code></td></tr>
+  <tr><td><code>--mode</code></td><td>分裂模式 horiz/vert/quad</td><td><code>--mode quad</code></td></tr>
+  <tr><td><code>--s1 / --s2</code></td><td>点1/点2 有悬垂串</td><td><code>--s1 --s2</code></td></tr>
+  <tr><td><code>--d1 / --d2</code></td><td>串长 D1/D2（m）</td><td><code>--d1 3 --d2 4</code></td></tr>
+  <tr><td><code>--a1 / --a2</code></td><td>串风偏角 A1/A2（°，右偏为正）</td><td><code>--a1 10 --a2 -5</code></td></tr>
+  <tr><td><code>--wind / --b</code></td><td>绘制风偏线 / 线偏角 B（°）</td><td><code>--wind --b 20</code></td></tr>
+  <tr><td><code>--cad</code></td><td>强制指定 CAD</td><td><code>--cad autocad</code></td></tr>
+</table>
+
+<h2>七、常见问题</h2>
+
+<h3>Q: 连接失败 / 无法连接 CAD</h3>
+<p>确保 CAD 已启动并打开了一张图纸。在 GUI 中确认「目标」下拉选对了 CAD 或「自动」。两个 CAD 同时开时建议用「自动」或手动指定。</p>
+
+<h3>Q: 点选时没反应 / 报错</h3>
+<p>点选操作是在 CAD 的命令行进行的，不是在 Python 窗口。程序会最小化 GUI 窗口，此时应在 CAD 中操作。若误点取消（ESC），程序会提示"已取消"。</p>
+
+<h3>Q: 生成的曲线看不到 / 太小</h3>
+<p>弧垂在短档距下很小。例如 K=15、档距 100m → 弧垂约 1.5m；档距 300m → 弧垂约 13m。程序会自动 ZoomExtents，若仍看不见，检查 K 值和档距是否合理。</p>
+
+<h3>Q: 风偏曲线与原曲线重合</h3>
+<p>当输入角度为 0° 时无偏转，生成曲线与原曲线重合。输入非零角度即可。</p>
+
+<h3>Q: K 值和应力+比载输入，为什么结果一样 / 不一样</h3>
+<p>两种输入是同一曲线的两种表述：只要 σ₀、γ 满足 K=γ/(8σ₀)，画出的就是同一条悬链线（等高与高差大时都一致）；若 σ₀/γ 与 K 不对应（例如切到「应力+比载」时框里残留上次的旧值），结果自然不同。K 值模式同样走悬链线 + 牛顿迭代高差修正（a = 1/(8K)）。</p>
+
+<h3>Q: 分裂导线方向不对 / 画歪了</h3>
+<p>分裂方向基于"弦平面局部坐标系"，风偏后的曲线分裂方向随平面旋转是正确行为（子导线与中心线平行、间距恒为 d）。若觉得"歪"，是风偏场景下的正常几何。</p>
+
+<h2>八、颜色与图层总览</h2>
+<table>
+  <tr><th>图元</th><th>颜色</th><th>图层</th></tr>
+  <tr><td>弧垂曲线（基准）</td><td>红</td><td>悬链线</td></tr>
+  <tr><td>最小距离连线 / 标注</td><td>绿</td><td>最小距离示意</td></tr>
+  <tr><td>风偏弧垂曲线</td><td>蓝</td><td>风偏弧垂曲线</td></tr>
+  <tr><td>分裂导线（子导线）</td><td>黄</td><td>分裂导线</td></tr>
+  <tr><td>悬垂串（非风偏竖直串）</td><td>品红</td><td>悬垂串</td></tr>
+  <tr><td>悬垂串（风偏摆串）</td><td>浅蓝</td><td>悬垂串风偏</td></tr>
+</table>
+
+<h2>九、技术说明</h2>
+<ul>
+  <li><strong>悬链线方程</strong>：y = a·cosh((x−x₀)/a) + y₀，a = 1/(8K)</li>
+  <li><strong>弧垂定义</strong>：两端连线中点沿 Z 轴竖直向下与曲线交点的距离</li>
+  <li><strong>曲线类型</strong>：AcDb3dPolyline（真三维多段线，Z 不丢失）</li>
+  <li><strong>风偏旋转</strong>：Rodrigues 旋转公式，绕首尾端点连线为轴</li>
+  <li><strong>分裂导线</strong>：弦平面局部坐标（u 弦向 / n 平面法线 / v=n×u），子导线 = 中心线等距平移</li>
+  <li><strong>悬垂串</strong>：下端 = 上端 + right·D·sin(A) − z·D·cos(A)；风偏线 = 摆串端点基准绕弦转 B</li>
+</ul>
+
+<h2>十、开源许可与项目地址</h2>
+<ul>
+  <li><strong>GitHub 仓库</strong>：<a href="https://github.com/kophmz/catenary-cad-tool" target="_blank">https://github.com/kophmz/catenary-cad-tool</a> —— 可在此获取源码、最新版本、更新记录与提交反馈（Issue）。</li>
+  <li><strong>开源协议</strong>：本项目基于 <a href="LICENSE" target="_blank">MIT License</a> 开源（Copyright © 2026 Mz）。允许自由使用、修改、分发（含商业用途），但需保留版权声明与许可文本，详见仓库根目录 <code>LICENSE</code> 文件。</li>
+</ul>
+
+</body>
+</html>

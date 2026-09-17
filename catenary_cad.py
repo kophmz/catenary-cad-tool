@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-catenary_cad — CAD COM 交互封装（GstarCAD / AutoCAD 通用）
+catenary_cad — CAD COM 交互封装（AutoCAD / GstarCAD / 中望CAD 通用）
 ============================================================
 
 从主程序 catenary_app.py 抽取的 win32com 交互层，供主程序与辅助脚本
@@ -48,16 +48,48 @@ COLOR_SUSPENSION_WIND = 4  # ACI: 4 = 浅蓝（风偏后的悬垂串）
 
 # ─── 连接 ───────────────────────────────────────────────────────────
 
-# CAD 程序 ProgID 偏好顺序：先 GstarCAD，后 AutoCAD（均可被 --cad 强制）
-_CAD_PROGIDS = {
-    "gstar": ["GCAD.Application", "GstarCAD.Application"],
-    "autocad": ["AutoCAD.Application"],
-}
-_CAD_LABELS = {
-    "GCAD.Application": "GstarCAD",
-    "GstarCAD.Application": "GstarCAD",
-    "AutoCAD.Application": "AutoCAD",
-}
+# ─── CAD 家族配置表（全项目「有哪几种 CAD」的唯一出处）────────────────
+#
+# 新增一种 CAD 只需在表里加一行 —— 连接 / 诊断 / 检测 / GUI 下拉 /
+# CLI --cad 全部自动生效，无需改动任何其他函数。
+#
+#   key    : 内部标识（prefer 取值、--cad 参数）
+#   label  : 显示名（状态栏、下拉、诊断报告）
+#   prefix : 注册表 ProgID 前缀，运行时动态枚举版本化后缀
+#            （AutoCAD 为数字版 .23/.24，中望为年份版 .2024/.2025）
+#   exe    : 主程序文件名，窗口枚举兜底与进程检测用
+#
+# 行序 = 自动模式兜底优先级（表前优先）。同一 key 可有多行（多个 ProgID 前缀）。
+_CAD_FAMILIES = [
+    {"key": "autocad", "label": "AutoCAD", "prefix": "AutoCAD.Application",
+     "exe": "acad.exe"},
+    {"key": "gstar", "label": "GstarCAD", "prefix": "GCAD.Application",
+     "exe": "gcad.exe"},
+    {"key": "gstar", "label": "GstarCAD", "prefix": "GstarCAD.Application",
+     "exe": "gcad.exe"},
+    {"key": "zwcad", "label": "中望CAD", "prefix": "ZWCAD.Application",
+     "exe": "zwcad.exe"},
+]
+
+
+def cad_family_labels() -> list[tuple[str, str]]:
+    """[(key, label), ...]，按表序去重。供 GUI 下拉与 CLI choices 生成。"""
+    out, seen = [], set()
+    for fam in _CAD_FAMILIES:
+        if fam["key"] not in seen:
+            seen.add(fam["key"])
+            out.append((fam["key"], fam["label"]))
+    return out
+
+
+def cad_family_keys() -> list[str]:
+    """所有合法的 prefer / --cad 取值（按表序）。"""
+    return [k for k, _ in cad_family_labels()]
+
+
+def _all_cad_names() -> str:
+    """所有显示名拼接，用于错误文案，如 "AutoCAD / GstarCAD / 中望CAD"。"""
+    return " / ".join(lbl for _, lbl in cad_family_labels())
 
 
 def _list_cad_progids(prefix: str) -> list[str]:
@@ -95,14 +127,58 @@ def _list_cad_progids(prefix: str) -> list[str]:
     return bare + vers
 
 
+def _progid_available(progid: str) -> bool:
+    """校验 ProgID 是否真的可用（CLSID 可读且 LocalServer32 的 exe 存在）。
+
+    注册表里常留有卸载/降级产生的空壳 ProgID——如实测发现的
+    `ZWCAD.Application.2026`（LocalServer32 指向的 exe 已不存在）。而
+    `_list_cad_progids` 按版本降序排列，会把该残留项排在有效项之前。
+    提前剔除可避免：连接时白跑一次失败尝试；报错文案里出现
+    "某版本连接失败"这类误导性噪音。
+    """
+    return _get_cad_exe_path(progid) is not None
+
+
+def _progids_for(key: str | None = None) -> list[str]:
+    """按配置表动态枚举 ProgID（含版本化项），去重保序。
+
+    key=None → 全部 CAD（按表序，即自动模式的兜底优先级）；
+    key='zwcad' → 仅该 key 下全部前缀的枚举结果。
+
+    三级兜底，保证任何情况下都有可尝试项、错误提示不落空：
+      1) 正常：返回枚举到且校验可用的 ProgID；
+      2) 枚举到但全被校验剔除（可能 exe 路径解析异常）→ 退回未校验列表，
+         宁可多试一次，也不误判成「本机没有可用 CAD」；
+      3) 注册表完全没有 → 退回前缀本身，让 Dispatch 报出「未注册」的精确错误。
+    """
+    out, raw, seen = [], [], set()
+    for fam in _CAD_FAMILIES:
+        if key is not None and fam["key"] != key:
+            continue
+        for progid in _list_cad_progids(fam["prefix"]):
+            if progid in seen:
+                continue
+            seen.add(progid)
+            raw.append(progid)
+            if _progid_available(progid):
+                out.append(progid)
+    if out:
+        return out
+    if raw:
+        return raw
+    return [f["prefix"] for f in _CAD_FAMILIES
+            if key is None or f["key"] == key]
+
+
 def _cad_label(progid: str) -> str:
     """把 ProgID 映射为人类可读的 CAD 名（兼容带版本号后缀的 ProgID）。
 
-    例如 'AutoCAD.Application.23.1' → 'AutoCAD'（2020 的版本化 ProgID）。
+    例如 'AutoCAD.Application.23.1' → 'AutoCAD'（2020 的版本化 ProgID）、
+    'ZWCAD.Application.2025' → '中望CAD'。
     """
-    for base, label in _CAD_LABELS.items():
-        if progid == base or progid.lower().startswith(base.lower()):
-            return label
+    for fam in _CAD_FAMILIES:
+        if progid.lower().startswith(fam["prefix"].lower()):
+            return fam["label"]
     return progid
 
 
@@ -136,13 +212,15 @@ def _classify_com_error(exc: Exception) -> tuple[str, str]:
         if hr_u == 0x800401F3 or hr_u == 0x80040154:
             return (
                 "CAD 未注册",
-                "当前 Windows 注册表中找不到 AutoCAD / GstarCAD 的 COM 标识。\n"
+                f"当前 Windows 注册表中找不到 {_all_cad_names()} 的 COM 标识。\n"
                 "常见原因：\n"
-                "  1) 本机未安装 AutoCAD 或 GstarCAD；\n"
+                "  1) 本机未安装上述任一 CAD；\n"
                 "  2) 安装的是绿色版/精简版，未写入注册表；\n"
                 "  3) 操作系统为 64 位，但运行了 32 位 Python/COM，"
                 "无法读取 64 位注册表。\n\n"
-                "建议：用 64 位 Python 运行；或重装 CAD 并勾选“用于第三方应用程序的 COM 支持”。",
+                "建议：用 64 位 Python 运行；或重装 CAD 并在安装时勾选"
+                "“用于第三方应用程序的 COM 支持”"
+                "（中望 CAD 需勾选 COM/ActiveX 支持）。",
             )
         if hr_u == 0x800702EC:
             return (
@@ -163,8 +241,9 @@ def _classify_com_error(exc: Exception) -> tuple[str, str]:
     if "无效的类字符串" in msg or "Class not registered" in msg:
         return (
             "CAD 未注册",
-            "当前 Windows 注册表中找不到 AutoCAD / GstarCAD 的 COM 标识。\n"
-            "建议：确认本机已安装 CAD；如已安装，尝试用 64 位 Python 运行本工具。",
+            f"当前 Windows 注册表中找不到 {_all_cad_names()} 的 COM 标识。\n"
+            "建议：确认本机已安装 CAD；如已安装，尝试用 64 位 Python 运行本工具"
+            "（中望 CAD 需在安装时勾选 COM/ActiveX 支持）。",
         )
     if "需要提升" in msg or "elevation" in msg.lower():
         return (
@@ -175,20 +254,16 @@ def _classify_com_error(exc: Exception) -> tuple[str, str]:
 
 
 def list_registered_cad() -> dict[str, list[str]]:
-    """扫描注册表，返回本机已注册的 CAD ProgID 列表。
+    """扫描注册表，返回本机已注册的 CAD ProgID 列表（按配置表的显示名分组）。
 
     Returns:
-        {"AutoCAD": ["AutoCAD.Application", ...], "GstarCAD": [...]}
+        {"AutoCAD": ["AutoCAD.Application", ...], "GstarCAD": [...],
+         "中望CAD": [...]}
         若某类为空，表示注册表中未找到对应 COM 注册项。
     """
-    result: dict[str, list[str]] = {"AutoCAD": [], "GstarCAD": []}
-    for label, progids in [
-        # 动态枚举（含版本化 ProgID，如 AutoCAD.Application.23/.24）
-        ("GstarCAD", _list_cad_progids("GCAD.Application")
-         + _list_cad_progids("GstarCAD.Application")),
-        ("AutoCAD", _list_cad_progids("AutoCAD.Application")),
-    ]:
-        for progid in progids:
+    result: dict[str, list[str]] = {lbl: [] for _, lbl in cad_family_labels()}
+    for fam in _CAD_FAMILIES:
+        for progid in _list_cad_progids(fam["prefix"]):
             try:
                 with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, progid) as key:
                     # 存在 ProgID 键就算注册；进一步检查 CLSID 更严谨
@@ -197,7 +272,8 @@ def list_registered_cad() -> dict[str, list[str]]:
                             winreg.QueryValueEx(clsid_key, "")  # 仅确认可读
                     except FileNotFoundError:
                         continue
-                result[label].append(progid)
+                if progid not in result[fam["label"]]:
+                    result[fam["label"]].append(progid)
             except FileNotFoundError:
                 pass
             except OSError:
@@ -209,14 +285,14 @@ def diagnose_cad_connection(prefer: str | None = None) -> str:
     """生成一段人类可读的 CAD 连接诊断报告。"""
     reg = list_registered_cad()
     lines = ["本机 CAD COM 注册状态："]
-    for label in ("AutoCAD", "GstarCAD"):
+    for _key, label in cad_family_labels():
         if reg[label]:
             lines.append(f"  {label}: 已注册 ({', '.join(reg[label])})")
         else:
             lines.append(f"  {label}: 未注册")
     total = sum(len(v) for v in reg.values())
     if total == 0:
-        lines.append("\n结论：注册表中没有发现 AutoCAD / GstarCAD 的 COM 项。")
+        lines.append(f"\n结论：注册表中没有发现 {_all_cad_names()} 的 COM 项。")
         lines.append("请先确认 CAD 已安装；如已安装，尝试用 64 位 Python 重新运行本工具。")
     else:
         lines.append("\n注册表项正常，但 GetActiveObject/Dispatch 仍可能因权限、CAD 未启动等失败。")
@@ -428,26 +504,23 @@ def _win32():
 def _detect_cad_windows():
     """通过 COM GetActiveObject 检测所有正在运行的 CAD 实例的主窗口。
 
-    每个 CAD 只查一次（GetActiveObject），取 app.HWND 精确获取其主窗口句柄，
-    避免扫描全局窗口列表时 exe/标题匹配不可靠的问题。
+    每个 key 只查一次（命中即 break），取 app.HWND 精确获取其主窗口句柄，
+    避免扫描全局窗口列表时 exe/标题匹配不可靠的问题。ProgID 走
+    `_progids_for()`（含注册表残留剔除），与 get_gcad 的候选集保持一致。
 
     Returns:
-        [(label, hwnd), ...], 如 [('autocad', 0x1234), ('gstar', 0x5678)]。
-        label = 'autocad' / 'gstar'。检测不到返回空列表。
+        [(key, hwnd), ...]，如 [('autocad', 0x1234), ('gstar', 0x5678)]。
+        key 取自配置表（'autocad' / 'gstar' / 'zwcad'）。检测不到返回空列表。
     """
     win32com, _, win32gui, _ = _win32()
     results = []
-    for label, progids in [
-        ("gstar", _list_cad_progids("GCAD.Application")
-         + _list_cad_progids("GstarCAD.Application")),
-        ("autocad", _list_cad_progids("AutoCAD.Application")),
-    ]:
-        for progid in progids:
+    for key, _label in cad_family_labels():
+        for progid in _progids_for(key):
             try:
                 gc = win32com.client.GetActiveObject(progid)
                 hwnd = int(getattr(gc, "HWND", 0))
                 if hwnd and win32gui.IsWindow(hwnd):
-                    results.append((label, hwnd))
+                    results.append((key, hwnd))
                     break  # 该 CAD 已找到
             except Exception:
                 continue
@@ -463,7 +536,7 @@ def foreground_cad_prefer(self_hwnd=None):
       （被 GUI 弹出前最后一次带到前台的 CAD）。
     - 全没检测到 → 返回 None。
 
-    返回 'autocad' / 'gstar' / None。
+    返回配置表的 key（'autocad' / 'gstar' / 'zwcad'）或 None。
     """
     try:
         _, _, win32gui, win32con = _win32()
@@ -488,8 +561,9 @@ def foreground_cad_prefer(self_hwnd=None):
 
 
 def get_gcad(prefer=None):
-    """连接 CAD（AutoCAD 或 GstarCAD），返回 (gc, doc, ms, app_name)。
+    """连接 CAD，返回 (gc, doc, ms, app_name)。
 
+    支持的 CAD 由 _CAD_FAMILIES 配置表决定（AutoCAD / GstarCAD / 中望CAD）。
     优先连已运行的实例（GetActiveObject），否则尝试启动程序（Dispatch）。
     当 Dispatch 因 UAC 提权失败时，回退到 subprocess 直接启动 CAD 进程，
     再用 GetActiveObject 连接——这是非管理员环境下最常见的连接失败场景。
@@ -499,30 +573,28 @@ def get_gcad(prefer=None):
       - None (自动)：先检测正在运行的 CAD 实例——
         * 只有一个在跑 → 精准连它（避免 CLI 场景下 AutoCAD 优先却把
           GstarCAD 用户的 AutoCAD 误启动出来）；
-        * 两个都在跑 / 都没跑 → AutoCAD 优先，失败兜底 GstarCAD。
-      - 'autocad' / 'gstar'（下拉手动指定）：只连该 CAD，连不上即报错，
-        绝不悄悄连到另一种 CAD（否则会出现"选了 GstarCAD 却连上 AutoCAD"）。
+        * 多个在跑 / 都没跑 → 按配置表行序兜底（AutoCAD 优先）。
+      - 配置表里的 key（'autocad' / 'gstar' / 'zwcad'，手动指定）：
+        只连该 CAD，连不上即报错，绝不悄悄连到另一种 CAD
+        （否则会出现"选了中望CAD 却连上 AutoCAD"）。
     """
     win32com, _, _, _ = _win32()
-    # 动态枚举 ProgID（含版本化项），覆盖多版本 AutoCAD 共存场景：
+    if prefer is not None and prefer not in cad_family_keys():
+        raise RuntimeError(
+            f'未知的目标 CAD："{prefer}"，可选：{", ".join(cad_family_keys())}')
+    # 动态枚举 ProgID（含版本化项），覆盖多版本 CAD 共存场景：
     # 无版本别名只指向最后注册的版本，用户开着旧版实例时必须用
-    # AutoCAD.Application.23 等版本化 ProgID 才能 GetActiveObject 到。
-    _autocad = _list_cad_progids("AutoCAD.Application") or list(_CAD_PROGIDS["autocad"])
-    _gstar = (_list_cad_progids("GCAD.Application")
-              + _list_cad_progids("GstarCAD.Application")) or list(_CAD_PROGIDS["gstar"])
-    if prefer == "autocad":
-        progids = _autocad
-    elif prefer == "gstar":
-        progids = _gstar
+    # AutoCAD.Application.23 / ZWCAD.Application.2025 等版本化 ProgID
+    # 才能 GetActiveObject 到。_progids_for 同时剔除注册表残留项。
+    if prefer:
+        progids = _progids_for(prefer)
     else:  # 自动：先探测运行实例，单实例精准连
         try:
             running = _detect_cad_windows()
-            if len(running) == 1:
-                progids = _autocad if running[0][0] == "autocad" else _gstar
-            else:
-                progids = _autocad + _gstar
+            progids = (_progids_for(running[0][0]) if len(running) == 1
+                       else _progids_for(None))
         except Exception:
-            progids = _autocad + _gstar
+            progids = _progids_for(None)
 
     # 每次连接前清空进程检测缓存，避免进程状态过期
     _proc_running_cache.clear()

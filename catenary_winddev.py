@@ -2,7 +2,7 @@
 
 功能
 ----
-在 GstarCAD / AutoCAD 中选取一条弧垂曲线（AcDb3dPolyline / Line /
+在 AutoCAD / GstarCAD / 中望CAD 中选取一条弧垂曲线（AcDb3dPolyline / Line /
 Polyline / Spline 等），输入一个角度（度），基于原曲线生成一条
 「风偏弧垂曲线」：
   * 原曲线保留不动；
@@ -134,6 +134,10 @@ def cad_flow(angle: float | None, handle: str | None, cad: str | None = None):
 
 
 def main(argv=None):
+    # cad_family_keys() 只读配置表（catenary_cad 顶层无 pywin32 依赖），
+    # 在此处导入可让 selftest 分支完全不触碰 CAD 相关代码。
+    from catenary_cad import cad_family_keys
+
     parser = argparse.ArgumentParser(description="风偏弧垂曲线生成器（独立程序）")
     sub = parser.add_subparsers(dest="cmd")
     sub.add_parser("selftest", help="纯数学自检（不需要 CAD）")
@@ -141,8 +145,8 @@ def main(argv=None):
     p_cad.add_argument("--pick", action="store_true", help="交互点选曲线（默认）")
     p_cad.add_argument("--handle", type=str, default=None, help="按句柄指定曲线")
     p_cad.add_argument("--angle", type=float, default=None, help="风偏角(度)，省略则在 CAD 命令行输入")
-    p_cad.add_argument("--cad", choices=["gstar", "autocad"], default=None,
-                       help="强制指定 CAD (默认自动检测: 先 GstarCAD 后 AutoCAD)")
+    p_cad.add_argument("--cad", choices=cad_family_keys(), default=None,
+                       help="强制指定 CAD (默认自动检测: 优先已运行的实例)")
     args = parser.parse_args(argv)
 
     if args.cmd == "cad":

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-空间弧垂曲线工具 (CAD 通用版 · 支持 GstarCAD / AutoCAD)
+空间弧垂曲线工具 (CAD 通用版 · 支持 AutoCAD / GstarCAD / 中望CAD)
 ============================================================
 
 功能:
@@ -14,9 +14,9 @@
   5. 含悬垂绝缘子串的弧垂线（串长/串角独立，可选风偏线）。
 
 依赖:
-  - pywin32 (win32com)      —— 直连 CAD COM (GstarCAD / AutoCAD)
+  - pywin32 (win32com)      —— 直连 CAD COM (AutoCAD / GstarCAD / 中望CAD)
   - tkinter (标准库)        —— 界面
-  - CAD 已启动并打开图纸 (GstarCAD 或 AutoCAD)
+  - CAD 已启动并打开图纸 (AutoCAD / GstarCAD / 中望CAD)
 
 代码结构（重构后，消除三处重复——审查 Opt 2）:
   - catenary_core.py  —— 纯算法（悬链线/距离/旋转/分裂/悬垂串），零 CAD 依赖
@@ -63,6 +63,10 @@ from catenary_cad import (
     get_gcad_or_elevate,
     foreground_cad_prefer,
     diagnose_cad_connection,
+    # CAD 家族配置表（GUI 下拉 / CLI choices / 文案的唯一出处）
+    cad_family_labels,
+    cad_family_keys,
+    _all_cad_names,
     # 图层
     ensure_layer,
     # 交互
@@ -102,12 +106,12 @@ def _help_path():
 class CatenaryApp:
     def __init__(self, root):
         self.root = root
-        root.title("空间弧垂曲线工具 · CAD · v0.22")
+        root.title("空间弧垂曲线工具 · CAD · v0.23")
         root.geometry("700x900")
         root.resizable(False, False)
 
         self.gc = self.doc = self.ms = None
-        self.app_name = None  # 连接后记录的 CAD 名称（AutoCAD / GstarCAD）
+        self.app_name = None  # 连接后记录的 CAD 名称（AutoCAD / GstarCAD / 中望CAD）
 
         self._build_ui()
 
@@ -120,14 +124,15 @@ class CatenaryApp:
         f0.pack(fill="x", **pad)
         self.status_var = tk.StringVar(value="未连接")
         ttk.Label(f0, textvariable=self.status_var).pack(side="left")
-        # 目标 CAD 选择器：自动检测 / 强制 GstarCAD / 强制 AutoCAD
-        # （自动模式下先尝试 GstarCAD，再 AutoCAD；两者都开着时用此项强制 AutoCAD）
+        # 目标 CAD 选择器：自动检测 + 配置表里全部 CAD（见 catenary_cad._CAD_FAMILIES）
+        # （自动模式按表序兜底；多开时用此项强制指定，避免连错 CAD）
         self.cad_prefer_var = tk.StringVar(value="自动")
         sel = ttk.Frame(f0)
         sel.pack(side="left", padx=8)
         ttk.Label(sel, text="目标:").pack(side="left")
         ttk.OptionMenu(
-            sel, self.cad_prefer_var, "自动", "自动", "GstarCAD", "AutoCAD"
+            sel, self.cad_prefer_var, "自动",
+            *(["自动"] + [lbl for _, lbl in cad_family_labels()]),
         ).pack(side="left")
         ttk.Button(f0, text="使用说明", command=self.open_help).pack(side="right", padx=(0,4))
         ttk.Button(f0, text="诊断 CAD", command=self.diagnose).pack(side="right", padx=(0,4))
@@ -303,18 +308,21 @@ class CatenaryApp:
 
     # ---- 连接 -------------------------------------------------------
     def connect(self):
-        # 将下拉选择映射到 get_gcad 的 prefer 参数
-        _prefer_map = {"自动": None, "GstarCAD": "gstar", "AutoCAD": "autocad"}
+        # 将下拉选择映射到 get_gcad 的 prefer 参数（映射表由配置表生成）
+        _prefer_map = {"自动": None}
+        _prefer_map.update({lbl: key for key, lbl in cad_family_labels()})
         prefer = _prefer_map.get(self.cad_prefer_var.get(), None)
         if prefer is None:
             # 自动：若某 CAD 确为前台则用它；否则 prefer 保持 None，
-            # 交给 get_gcad 走「AutoCAD 优先 + GstarCAD 兜底」
+            # 交给 get_gcad 按配置表行序兜底
             fg = foreground_cad_prefer(self.root.winfo_id())
             prefer = fg
             if prefer:
-                self.log_msg(f"→ 自动检测到：{prefer}")
+                _label = dict(cad_family_labels()).get(prefer, prefer)
+                self.log_msg(f"→ 自动检测到：{_label}")
             else:
-                self.log_msg("→ 自动检测：未发现活跃CAD窗口，默认AutoCAD优先")
+                self.log_msg(
+                    f"→ 自动检测：未发现活跃CAD窗口，按默认顺序尝试（{_all_cad_names()}）")
         try:
             self.gc = self.doc = self.ms = None  # 先清空旧连接，确保真正刷新
             self.gc, self.doc, self.ms, app = get_gcad(prefer)
@@ -868,9 +876,10 @@ def cli_main():
                 pass
     import argparse
     parent = argparse.ArgumentParser(add_help=False)
-    parent.add_argument("--cad", choices=["gstar", "autocad"], default=None,
-                        help="强制指定 CAD (默认自动检测: 先 GstarCAD 后 AutoCAD)")
-    parser = argparse.ArgumentParser(description="空间弧垂曲线工具 (支持 GstarCAD / AutoCAD)")
+    parent.add_argument("--cad", choices=cad_family_keys(), default=None,
+                        help="强制指定 CAD (默认自动检测: 优先已运行的实例)")
+    parser = argparse.ArgumentParser(
+        description=f"空间弧垂曲线工具 (支持 {_all_cad_names()})")
     sub = parser.add_subparsers(dest="cmd")
 
     d = sub.add_parser("draw", parents=[parent], help="生成空间弧垂曲线")

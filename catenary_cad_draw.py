@@ -2,7 +2,7 @@
 """
 GstarCAD 三维悬链线绘制工具（win32com 直连版）
 
-连接 GstarCAD / AutoCAD（COM 直连），根据 K 值、两悬挂点三维坐标绘制
+连接 AutoCAD / GstarCAD / 中望CAD（COM 直连），根据 K 值、两悬挂点三维坐标绘制
 1:1（米）悬链线多段线。
 
 ⚠️ 历史修复（审查 Bug 1）：早期版本 import `mcp__gstarcad`（MCP 工具
@@ -46,7 +46,7 @@ def draw_catenary_in_gstarcad(points_3d, layer: str = "悬链线",
                                color: int = 1, lineweight: int = 30):
     """调用 win32com 直连 CAD 绘制三维悬链线多段线（修复 Bug 1）。
 
-    需要: 本机已安装 CAD（GstarCAD / AutoCAD）并至少打开一个图纸。
+    需要: 本机已安装 CAD（AutoCAD / GstarCAD / 中望CAD）并至少打开一个图纸。
 
     参数:
         points_3d: [(x,y,z), ...] 三维点序列
@@ -61,7 +61,7 @@ def draw_catenary_in_gstarcad(points_3d, layer: str = "悬链线",
         gc, doc, ms, app_name = get_gcad(None)
     except Exception as e:
         print(f"❌ 无法连接 CAD：{e}")
-        print("   请确认已启动 GstarCAD / AutoCAD 并打开图纸。")
+        print("   请确认已启动 AutoCAD / GstarCAD / 中望CAD 并打开图纸。")
         print("   替代方案: 使用 --no-cad 或 --cad-json 导出点集后手动导入。")
         return False
 

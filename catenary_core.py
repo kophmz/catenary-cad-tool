@@ -11,6 +11,9 @@ catenary_core — 悬链线纯算法模块（零 CAD/UI 依赖）
   - 悬链线计算：catenary_point / solve_catenary_2d / catenary_3d
     （n_pts 全链路透传——修复 Bug 2；不等高弧垂=弦中点定义——修复 Bug 3；
      牛顿迭代收敛保护——Opt 4）
+  - 二维断面悬链线：catenary_section_2d（图纸比例换算 + 反算实际尺寸，v0.24）
+  - 弧垂最低点倒三角标记：low_point_marker（顶点在最低点、三角形在曲线上方，
+    尺寸随图纸比例等比缩放，v0.24）
   - 曲线距离：closest_distance（AABB 快速排斥早退——Opt 3）
   - 刚体旋转：rotate_curve（轴向量/cos/sin 不变量只算一次——Opt 1，
     经 _rotate_precompute 预计算内联复用）；rotate_point（单点旋转，
@@ -28,12 +31,22 @@ import math
 import warnings
 
 __all__ = [
-    "catenary_point", "solve_catenary_2d", "catenary_3d",
+    "catenary_point", "solve_catenary_2d", "catenary_3d", "catenary_section_2d",
+    "low_point_marker", "MARKER_BASE_W", "MARKER_BASE_H",
+    "MARKER_RATIO_REF_X", "MARKER_RATIO_REF_Y",
     "closest_distance", "rotate_point", "rotate_curve",
     "bundle_offsets", "generate_bundle_lines", "BUNDLE_HORIZ",
     "BUNDLE_VERT", "BUNDLE_QUAD", "suspension_geometry",
     "format_gstarcad_polyline", "format_xyz_csv", "print_summary",
 ]
+
+# 弧垂最低点「倒三角」标记的基准尺寸：**默认图纸比例**（横 1:5000 / 纵 1:500）
+# 下顶部边长 2 个绘图单位、高 2 个绘图单位。比例变化时按比例分母等比放大/缩小，
+# 例：1:2500 / 1:250（分母都减半）→ 顶边 4、高 4（都翻倍）。
+MARKER_RATIO_REF_X = 5000.0   # 基准横向比例分母
+MARKER_RATIO_REF_Y = 500.0    # 基准纵向比例分母
+MARKER_BASE_W = 2.0           # 基准比例下的顶部边长（绘图单位）
+MARKER_BASE_H = 2.0           # 基准比例下的高度（绘图单位）
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -145,6 +158,192 @@ def catenary_3d(P1, P2, K: float, n_pts: int = 200):
     z_mid_curve = z1 + catenary_point(L / 2.0, a, x0, y0)
     sag_max = abs(z_mid_chord - z_mid_curve)
     return points_3d, sag_max, L, a, x0
+
+
+def catenary_section_2d(P1, P2, K: float, ratio_x: float = 5000.0,
+                        ratio_y: float = 500.0, n_pts: int = 200):
+    """二维断面悬链线：图纸坐标 ↔ 实际米数换算 → K 值悬链线 → 缩放回图。
+
+    适用场景：输电线路纵断面图（二维平面 XY）。图纸绘图单位 mm、
+    实际工程尺寸 m 时，出图比例 → 缩放系数为
+
+        scale = 1000 / 比例分母
+        横向 1:5000 → scale_x = 0.2  （图上 = 实际 × 1/5）
+        纵向 1:500   → scale_y = 2.0  （图上 = 实际 × 2）
+
+    即「图上坐标 = 实际坐标 × 1000 ÷ 比例分母」。
+
+    为什么必须"先反算、再正算"：K 值 (1/m) 只有作用在**实际档距**上才有
+    物理意义；若直接拿图上坐标当米用，档距会被缩小 scale_x 倍，画出来的
+    线几乎成了直线（K 值输入等于白做）。故数据流为：
+        ① 图上两点 P1、P2
+        ② 反算实际：L_real = |Δx| / scale_x，h_real = Δy / scale_y
+        ③ solve_catenary_2d(L_real, h_real, K, n_pts)  ← 算法完全复用
+        ④ 缩放回图：t = s / L_real
+                    x = x1 + t·(x2−x1)      （线性插值，自动兼容反向点选）
+                    y = y1 + z_rel · scale_y（z_rel 通常为负 ⇒ 曲线向下垂）
+    ② 与 ④ 互逆 ⇒ 曲线两端精确落在 P1、P2 上。
+
+    二维约定：拾取点的 X = 档距方向（水平），Y = 高程方向（即原三维的 Z
+    转为二维的 Y），拾取点的 Z 被忽略（始终画在 Z=0 平面）。
+
+    弧垂最低点：曲线始终包含弧垂最低点。最低点位于水平位置 s = x0（由
+    solve_catenary_2d 给出）。落在两挂点之间时曲线本就覆盖它；落在两挂点
+    之外时（大高差下坡档，x0 < 0 或 x0 > L_real）自动把曲线延伸至最低点。
+    延伸后两挂点仍为采样锚点 ⇒ 曲线仍精确经过用户点选的两点。
+
+    最低点标记：同时在最低点处生成一个**倒三角**（顶点在最低点、三角形在
+    曲线上方）的点列 info["marker_pts"]，尺寸随图纸比例缩放，见 low_point_marker。
+
+    Args:
+        P1, P2: 图上两点 (x, y[, z])，只取前两维
+        K: 弧垂 K 值 (1/m)，调用方需已乘 1e-5
+        ratio_x: 横向出图比例分母（默认 5000，即 1:5000）
+        ratio_y: 纵向出图比例分母（默认 500，即 1:500）
+        n_pts: 采样点数（默认 200）
+
+    Returns:
+        (points_2d, info)
+        - points_2d: [(x, y), ...] 图纸坐标点列（Z 由绘图端置 0）
+        - info: dict —— 含
+            L_real   实际水平档距 (m)
+            h_real   实际高差 (m)（右端点高程 − 左端点高程）
+            sag_real 实际弧垂 (m)（弦中点定义，与 catenary_3d 同口径）
+            sag_plot 图上弧垂（绘图单位）
+            a        悬链线参数 a (m)
+            scale_x / scale_y / ratio_x / ratio_y / n_pts
+            x0       最低点距 P1 的实际水平距离 (m)（负值＝在 P1 外侧）
+            z_low    最低点相对 P1 的实际高差 (m)（恒为负）
+            low_plot 最低点图上坐标 (x, y)
+            extended 最低点在两挂点之外、曲线已延伸至最低点
+            low_in_span 最低点落在两挂点之间
+            n_pts_used 实际采样点数（延伸时会加密）
+            marker_pts 最低点倒三角标记的闭合点列（顶点＝最低点，见
+                      low_point_marker）；marker_w / marker_h 为其顶边与高
+
+    Raises:
+        ValueError: 两点图上水平投影重合（|Δx| ≈ 0，档距方向无法确定）
+        ValueError: ratio_x / ratio_y 非正数
+    """
+    if ratio_x <= 0 or ratio_y <= 0:
+        raise ValueError("图纸比例分母必须为正数。")
+    x1, y1 = float(P1[0]), float(P1[1])
+    x2, y2 = float(P2[0]), float(P2[1])
+    dx = x2 - x1
+    if abs(dx) < 1e-9:
+        raise ValueError("两点在图上水平投影重合（X 相同），无法确定档距方向。")
+
+    scale_x = 1000.0 / float(ratio_x)   # 图纸单位 / 米
+    scale_y = 1000.0 / float(ratio_y)
+
+    # ② 反算实际尺寸（米）
+    L_real = abs(dx) / scale_x          # 实际水平档距 (m)
+    h_real = (y2 - y1) / scale_y        # 实际高差 (m)
+
+    # ③ 现有算法（cosh + 牛顿迭代，含高差修正），一行不改
+    a, x0, y0, s_vals, z_vals = solve_catenary_2d(L_real, h_real, K, n_pts)
+
+    # ③-补 弧垂最低点：悬链线最低点位于水平位置 s = x0（求解器返回）。
+    #       若最低点落在两挂点之外（x0 < 0 或 x0 > L_real，常见于大高差
+    #       下坡档），把采样区间延伸到最低点，使画出的曲线包含弧垂最低处；
+    #       延伸只扩展采样范围，曲线方程不变 ⇒ 原区间内形状与数值完全不变。
+    #       采样时把「两挂点 s=0 / s=L_real」与「最低点 s=x0」作为锚点精确
+    #       插入序列：挂点必须精确落在曲线上（否则均匀步长变化会让拾取点
+    #       偏离），最低点也必须是曲线上的点（均匀采样时最低点通常落在两个
+    #       采样点之间，见下）。
+    extend_lo = x0 < 0.0
+    extend_hi = x0 > L_real
+    extended = extend_lo or extend_hi
+    if extended:
+        s_lo = x0 if extend_lo else 0.0
+        s_hi = x0 if extend_hi else L_real
+        span = s_hi - s_lo
+        n_used = max(n_pts, int(math.ceil(n_pts * span / L_real)))  # 按跨度加密
+        s_vals = [s_lo + i * span / (n_used - 1) for i in range(n_used)]
+    else:
+        s_vals = [i * L_real / (n_pts - 1) for i in range(n_pts)]
+    # 锚点（挂点 + 最低点）精确并入，升序去重
+    s_vals = sorted(set(s_vals + [0.0, L_real, x0]))
+    z_vals = [catenary_point(s, a, x0, y0) for s in s_vals]
+
+    # ④ 缩放回图纸坐标（s / z_rel 均以 P1 为原点）
+    points_2d = []
+    for s, z_rel in zip(s_vals, z_vals):
+        t = s / L_real
+        points_2d.append((x1 + t * dx, y1 + z_rel * scale_y))
+
+    # 弧垂（与 catenary_3d 同口径）：精确水平跨中处「弦」与「曲线」之高差。
+    # z_vals 以左端点为 0，故弦在跨中为 h_real/2。
+    z_mid_chord = h_real / 2.0
+    z_mid_curve = catenary_point(L_real / 2.0, a, x0, y0)
+    sag_real = abs(z_mid_chord - z_mid_curve)
+
+    info = {
+        "L_real": L_real,
+        "h_real": h_real,
+        "sag_real": sag_real,
+        "sag_plot": sag_real * scale_y,
+        "a": a,
+        "n_pts": n_pts,
+        "n_pts_used": len(s_vals),
+        "scale_x": scale_x,
+        "scale_y": scale_y,
+        "ratio_x": float(ratio_x),
+        "ratio_y": float(ratio_y),
+        # —— 弧垂最低点 ——
+        # x0         最低点距 P1 的实际水平距离 (m)（负值＝在 P1 外侧）
+        # z_low      最低点相对 P1 的实际高差 (m)（恒为负 → 比 P1 低）
+        #            注意：曲线方程 z(s)=a·cosh((s-x0)/a)+y0 的最低值是
+        #            z(x0) = a + y0（y0 是「顶点的 y 截距」，不是最低点高度）
+        # low_plot   最低点的图上坐标 (x, y)
+        # extended   最低点原本在两挂点之外、曲线已延伸至最低点
+        # low_in_span 最低点落在两挂点水平区间内（曲线本就包含最低点）
+        "x0": x0,
+        "z_low": a + y0,
+        "low_plot": (x1 + (x0 / L_real) * dx, y1 + (a + y0) * scale_y),
+        "extended": extended,
+        "low_in_span": not extended,
+    }
+    # —— 最低点倒三角标记：顶点＝最低点，三角形在曲线上方；尺寸随比例缩放 ——
+    info["marker_pts"] = low_point_marker(info["low_plot"], ratio_x, ratio_y)
+    info["marker_w"] = MARKER_BASE_W * (MARKER_RATIO_REF_X / float(ratio_x))
+    info["marker_h"] = MARKER_BASE_H * (MARKER_RATIO_REF_Y / float(ratio_y))
+    return points_2d, info
+
+
+def low_point_marker(low_plot, ratio_x: float = MARKER_RATIO_REF_X,
+                     ratio_y: float = MARKER_RATIO_REF_Y,
+                     base_w: float = MARKER_BASE_W,
+                     base_h: float = MARKER_BASE_H):
+    """弧垂最低点「倒三角」标记的几何点列（纯几何，零 CAD 依赖）。
+
+    形状：等腰三角形**倒置**，**顶点（尖端）落在弧垂曲线的最低点**，三角形
+    整体位于曲线**上方**（底边在上、水平）。
+
+        apex (顶点) = low_plot                ← 曲线最低点
+        右上       = apex + ( +w/2, +h )
+        左上       = apex + ( −w/2, +h )
+
+    尺寸随图纸比例缩放（同一份图里标记的"实际大小"恒定，缩放后出图比例变了
+    标记也跟着变）：基准比例（横 1:5000 / 纵 1:500）下顶边 2、高 2 个绘图单位
+
+        w = base_w × 基准横向比例分母 / ratio_x    （1:5000→2，1:2500→4）
+        h = base_h × 基准纵向比例分母 / ratio_y    （1:500 →2，1:250 →4）
+
+    Args:
+        low_plot: 最低点图上坐标 (x, y)（catenary_section_2d 的 info["low_plot"]）
+        ratio_x / ratio_y: 当前图纸比例分母（与 catenary_section_2d 同参数）
+        base_w / base_h: 基准比例下的顶边与高度（默认 2 / 2，一般不改）
+
+    Returns:
+        [(apex), (右上), (左上), (apex)] —— **闭合点列**（首尾同点），可直接
+        交给 draw_catenary_2d / AddLightWeightPolyline 画成三角形线框。
+    """
+    x, y = float(low_plot[0]), float(low_plot[1])
+    w = float(base_w) * (MARKER_RATIO_REF_X / float(ratio_x))
+    h = float(base_h) * (MARKER_RATIO_REF_Y / float(ratio_y))
+    half = w / 2.0
+    return [(x, y), (x + half, y + h), (x - half, y + h), (x, y)]
 
 
 # ───────────────────────────────────────────────────────────────────

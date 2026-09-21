@@ -805,6 +805,9 @@ def extract_points(entity):
     if name == "AcDb3dPolyline":
         c = list(entity.Coordinates)
         return [(c[i], c[i + 1], c[i + 2]) for i in range(0, len(c), 3)]
+    if name == "AcDb2dPolyline":  # 重载二维多段线（AddPolyline 产物，坐标为 OCS）
+        c = list(entity.Coordinates)
+        return [(c[i], c[i + 1], c[i + 2]) for i in range(0, len(c), 3)]
     if name == "AcDbPolyline":  # 轻量多段线 (LW)
         c = list(entity.Coordinates)
         z = getattr(entity, "Elevation", 0.0) or 0.0
@@ -862,6 +865,53 @@ def draw_catenary(doc, ms, points_3d, color=1):
     poly.Color = color
     poly.Layer = LAYER_NAME
     return poly
+
+
+def draw_catenary_2d(doc, ms, points_2d, color=1, layer=LAYER_NAME):
+    """绘制二维断面悬链线（默认红、图层'悬链线'），返回 (实体, 模式)。
+
+    主用 ``AddLightWeightPolyline``（轻量二维多段线，EntityName=AcDbPolyline），
+    坐标是 **2D 扁平数组** [x1,y1,x2,y2,...]（与 Add3DPoly 的 3D 数组不同）。
+
+    兜底：v0.23 只在三种 CAD 上实测过 ``Add3DPoly``，``AddLightWeightPolyline``
+    尚未逐一验证（中望尤甚）。若目标 CAD 不提供该方法，退化为 ``Add3DPoly``
+    传 Z=0 —— 曲线仍落在 XY 平面，视觉完全一致，且 ``extract_points`` 已支持
+    ``AcDb3dPolyline``，不影响「两条曲线最小距离」功能。
+
+    Args:
+        points_2d: [(x, y), ...] 图纸坐标点列（≥2 点；Z 一律置 0）
+    Returns:
+        (poly, mode)  mode ∈ {"lwpolyline", "3dpoly"}，供调用方提示是否走了兜底
+    """
+    ensure_layer(doc, layer)
+    pts = [(float(p[0]), float(p[1])) for p in points_2d]
+    try:
+        poly = ms.AddLightWeightPolyline(_variant([v for p in pts for v in p]))
+        mode = "lwpolyline"
+        try:
+            poly.Elevation = 0.0  # 明确压到 Z=0 平面（OCS 高程）
+        except Exception:
+            pass
+    except Exception:
+        poly = ms.Add3DPoly(_variant([v for p in pts for v in (p[0], p[1], 0.0)]))
+        mode = "3dpoly"
+    poly.Color = color
+    poly.Layer = layer
+    return poly, mode
+
+
+def draw_low_point_marker(doc, ms, marker_pts, color=1, layer=LAYER_NAME):
+    """绘制弧垂最低点的「倒三角」标记（默认红、与曲线同图层'悬链线'）。
+
+    marker_pts 是**闭合点列**（首尾同点，见 catenary_core.low_point_marker），
+    直接复用 draw_catenary_2d 的二维多段线通路 —— 一并继承它的兜底
+    （``AddLightWeightPolyline`` 不可用时退化为 ``Add3DPoly`` 传 Z=0），
+    三角形本身是首尾相接的四点，故**不依赖** ``Closed`` 属性是否可用。
+
+    Returns:
+        (poly, mode)  同 draw_catenary_2d，mode ∈ {"lwpolyline", "3dpoly"}
+    """
+    return draw_catenary_2d(doc, ms, marker_pts, color=color, layer=layer)
 
 
 def draw_distance_line(doc, ms, p1, p2, color=3):

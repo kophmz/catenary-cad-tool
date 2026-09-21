@@ -49,6 +49,7 @@ from tkinter import ttk, messagebox
 
 from catenary_core import (
     catenary_3d,
+    catenary_section_2d,
     closest_distance,
     rotate_curve,
     generate_bundle_lines,
@@ -78,6 +79,8 @@ from catenary_cad import (
     get_entity_by_handle,
     # 绘制
     draw_catenary,
+    draw_catenary_2d,
+    draw_low_point_marker,
     draw_distance_line,
     draw_distance_label,
     draw_wind_curve,
@@ -85,6 +88,7 @@ from catenary_cad import (
     draw_bundle_line,
     draw_suspension_line,
     # 图层/颜色常量（全项目唯一出处）
+    LAYER_NAME,
     LAYER_WIND,
     LAYER_SUSPENSION,
     LAYER_SUSPENSION_WIND,
@@ -99,6 +103,30 @@ def _help_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "使用说明.html")
 
 
+def _is_cancel_error(e):
+    """判断 COM 异常是否由用户取消 (ESC / 右键) 引起（GUI 与 CLI 共用同一判定）。
+
+    ⚠️ 各 CAD 的取消文案不统一（"用户取消" / "已取消" / "Cancel" / ESC…），
+    故同时匹配多组中英文关键词。调用方另有兜底：连续点选过程中只要**取点失败**
+    即结束链路并保留已画曲线，不依赖本判定是否命中。
+    """
+    s = str(e).lower()
+    return any(k in s for k in ("cancel", "取消", "esc", "userinterrupt", "discard"))
+
+
+def _low_point_note(info):
+    """弧垂最低点的一句话说明（GUI 日志与 CLI 共用同一文案）。"""
+    low = info["low_plot"]
+    dy = info["z_low"]
+    rel = f"低于起点 {abs(dy):.2f}m" if dy < 0 else f"高于起点 {abs(dy):.2f}m"
+    where = "位于两挂点之间" if info["low_in_span"] else "在两挂点之外，曲线已延伸至最低点"
+    mk = ""
+    if "marker_w" in info:
+        mk = f"  倒三角标记 顶边{info['marker_w']:g}×高{info['marker_h']:g}"
+    return (f"最低点: 距起点 {info['x0']:.2f}m  {rel}  "
+            f"图上({low[0]:.2f}, {low[1]:.2f})（{where}）{mk}")
+
+
 # ───────────────────────────────────────────────────────────────────
 # GUI
 # ───────────────────────────────────────────────────────────────────
@@ -106,8 +134,8 @@ def _help_path():
 class CatenaryApp:
     def __init__(self, root):
         self.root = root
-        root.title("空间弧垂曲线工具 · CAD · v0.23")
-        root.geometry("700x900")
+        root.title("空间弧垂曲线工具 · CAD · v0.24")
+        root.geometry("700x1000")
         root.resizable(False, False)
 
         self.gc = self.doc = self.ms = None
@@ -284,6 +312,31 @@ class CatenaryApp:
         ttk.Label(fs, textvariable=self.susp_info, foreground="#444",
                   wraplength=620, justify="left").pack(anchor="w")
 
+        # 模块 6：二维断面悬链线
+        f2d = ttk.LabelFrame(self.root, text="⑥ 二维断面悬链线（断面图）")
+        f2d.pack(fill="x", **pad)
+        s2row = ttk.Frame(f2d)
+        s2row.pack(fill="x")
+        ttk.Label(s2row, text="K 值 (省略10⁻⁵):").pack(side="left")
+        self.sec_k_var = tk.StringVar(value="15.22")
+        ttk.Entry(s2row, textvariable=self.sec_k_var, width=8).pack(side="left", padx=2)
+        ttk.Label(s2row, text="横向 1:").pack(side="left", padx=(10, 0))
+        self.sec_rx_var = tk.StringVar(value="5000")
+        ttk.Entry(s2row, textvariable=self.sec_rx_var, width=7).pack(side="left", padx=2)
+        ttk.Label(s2row, text="纵向 1:").pack(side="left", padx=(6, 0))
+        self.sec_ry_var = tk.StringVar(value="500")
+        ttk.Entry(s2row, textvariable=self.sec_ry_var, width=6).pack(side="left", padx=2)
+        ttk.Label(s2row, text="采样点数:").pack(side="left", padx=(6, 0))
+        ttk.Entry(s2row, textvariable=self.n_var, width=5).pack(side="left", padx=2)
+        ttk.Button(s2row, text="拾取挂线点并生成", command=self.do_section).pack(side="right")
+        self.sec_info = tk.StringVar(
+            value="可连续点选：点第 1、2 点生成第 1 段，之后每点一次接一段"
+                  "（上段终点＝本段起点），ESC/右键结束。X＝档距方向、Y＝高程方向。"
+                  "比例：图纸 1 单位＝1mm → 横向 1:5000 时图上 1mm＝实际 5m（×1/5），"
+                  "纵向 1:500 时图上 1mm＝实际 0.5m（×2）。")
+        ttk.Label(f2d, textvariable=self.sec_info, foreground="#444",
+                  wraplength=620, justify="left").pack(anchor="w")
+
         # 署名（先 pack 固定底部空间，日志框再占剩余空间）
         tk.Label(self.root, text="作者：Mz  ·  github.com/kophmz/catenary-cad-tool",
                  fg="#999", font=("Microsoft YaHei", 8)).pack(side="bottom", pady=(0, 4))
@@ -413,12 +466,7 @@ class CatenaryApp:
             p2 = pick_point(self.doc, "\n选择第2个悬挂点: ")
         except Exception as e:
             self.root.deiconify(); self.root.lift()
-            if self._is_user_cancel(e):
-                messagebox.showinfo("已取消", "点选已取消。")
-                self.log_msg("✘ 已取消点选")
-                return
-            messagebox.showerror("点选失败", str(e))
-            self.log_msg(f"✘ 点选失败: {e}")
+            self._pick_abort(e, "点选")
             return
         finally:
             self.root.deiconify(); self.root.lift()
@@ -448,11 +496,7 @@ class CatenaryApp:
             e2 = pick_entity(self.doc, "\n选择第2条曲线: ", self.app_name)
         except Exception as e:
             self.root.deiconify(); self.root.lift()
-            if self._is_user_cancel(e):
-                messagebox.showinfo("已取消", "选取已取消。")
-                return
-            messagebox.showerror("选取失败", str(e))
-            self.log_msg(f"✘ 选取失败: {e}")
+            self._pick_abort(e, "选取")
             return
         finally:
             self.root.deiconify(); self.root.lift()
@@ -494,12 +538,7 @@ class CatenaryApp:
             ent = pick_entity(self.doc, "\n选择一条弧垂曲线: ", self.app_name)
         except Exception as e:
             self.root.deiconify(); self.root.lift()
-            if self._is_user_cancel(e):
-                messagebox.showinfo("已取消", "选取已取消。")
-                self.log_msg("✘ 已取消点选")
-                return
-            messagebox.showerror("选取失败", str(e))
-            self.log_msg(f"✘ 选取失败: {e}")
+            self._pick_abort(e, "选取")
             return
         finally:
             self.root.deiconify(); self.root.lift()
@@ -548,12 +587,7 @@ class CatenaryApp:
             ent = pick_entity(self.doc, "\n选择中心线(弧垂曲线): ", self.app_name)
         except Exception as e:
             self.root.deiconify(); self.root.lift()
-            if self._is_user_cancel(e):
-                messagebox.showinfo("已取消", "选取已取消。")
-                self.log_msg("✘ 已取消点选")
-                return
-            messagebox.showerror("选取失败", str(e))
-            self.log_msg(f"✘ 选取失败: {e}")
+            self._pick_abort(e, "选取")
             return
         finally:
             self.root.deiconify(); self.root.lift()
@@ -623,12 +657,7 @@ class CatenaryApp:
             p2 = pick_point(self.doc, "\n选择第2个悬挂点: ")
         except Exception as e:
             self.root.deiconify(); self.root.lift()
-            if self._is_user_cancel(e):
-                messagebox.showinfo("已取消", "点选已取消。")
-                self.log_msg("✘ 已取消点选")
-                return
-            messagebox.showerror("点选失败", str(e))
-            self.log_msg(f"✘ 点选失败: {e}")
+            self._pick_abort(e, "点选")
             return
         finally:
             self.root.deiconify(); self.root.lift()
@@ -670,12 +699,124 @@ class CatenaryApp:
         self.susp_info.set(info)
         self.log_msg("✔ " + info.replace("\n", "  "))
 
+    # ---- 模块6 ------------------------------------------------------
+    def do_section(self):
+        """二维断面悬链线（连续点选）：图上两点 ÷ 比例 → 实际米数 → 算 K 值悬链线 → × 比例画回图上。
+
+        连续点选：点第 2 点生成「1-2」段后不退出，继续点第 3 点即生成「2-3」段
+        （上一段终点自动作为本段起点），如此可连续生成多段，K 值与比例全程相同；
+        按 ESC / 右键结束。端点不合法（如 X 相同）的段自动跳过并提示，不影响后续点选。
+        """
+        if not self._ensure_conn():
+            return
+        try:
+            n = max(8, int(self.n_var.get()))
+            K = float(self.sec_k_var.get()) * 1e-5
+            rx = float(self.sec_rx_var.get())
+            ry = float(self.sec_ry_var.get())
+            if rx <= 0 or ry <= 0:
+                raise ValueError("图纸比例分母必须为正数")
+            param_desc = f"K={float(self.sec_k_var.get())}×10⁻⁵  横向1:{rx:g}  纵向1:{ry:g}"
+        except ValueError as e:
+            if "必须为正数" in str(e):
+                messagebox.showerror("输入错误", str(e))
+            else:
+                messagebox.showerror("输入错误", f"输入必须是数字：{e}")
+            return
+
+        self.log_msg("→ 请在 CAD 中连续点选挂点（窗口已最小化）… "
+                     "每点一次生成一段，ESC/右键结束")
+        self.root.update()
+
+        segs = []          # [(info, handle, mode, p_from, p_to), ...]
+        err = None         # 致命错误（非用户取消）
+        warn = None        # 段级警告（该段被跳过）
+        p_prev = None
+        first = True
+        try:
+            self.root.iconify()  # 最小化 GUI，避免遮挡 CAD 点选；整条链结束才恢复
+            while True:
+                if first:
+                    prompt = "\n选择第1个挂点: "
+                elif not segs:
+                    prompt = "\n选择第2个挂点: "
+                else:
+                    prompt = "\n选择下一个挂点 (ESC/右键结束): "
+                try:
+                    p_next = pick_point(self.doc, prompt)
+                except Exception as e:
+                    if self._is_user_cancel(e):
+                        break          # ESC / 右键 = 正常结束连续点选
+                    # 兜底：链式模式下取点失败一律结束链路（已画的段全部保留），
+                    # 不弹错误框、不丢结果 —— 避免各 CAD 取消文案不同导致误报
+                    warn = f"⚠ 连续点选已结束（取点失败：{e}），已生成的曲线保留"
+                    break
+                if first:
+                    p_prev, first = p_next, False
+                    continue
+                try:
+                    # 只用 X/Y（丢弃拾取点的 Z）
+                    pts, info = catenary_section_2d(p_prev, p_next, K, rx, ry, n)
+                except ValueError as e:
+                    warn = f"⚠ 本段已跳过（{e}）请另选一个挂点"
+                    continue           # 不入链，仍以原挂点为起点
+                poly, mode = draw_catenary_2d(self.doc, self.ms, pts)
+                # 最低点倒三角标记（顶点＝最低点，画在曲线上方；随比例缩放）
+                mark, _mk_mode = draw_low_point_marker(
+                    self.doc, self.ms, info["marker_pts"])
+                segs.append((info, poly.Handle, mode, p_prev, p_next, mark.Handle))
+                p_prev = p_next
+                self.log_msg(
+                    f"  段{len(segs)}: 实际档距={info['L_real']:.2f}m  "
+                    f"实际高差={info['h_real']:.2f}m  实际弧垂={info['sag_real']:.3f}m  "
+                    f"图上弧垂={info['sag_plot']:.2f}  Handle={poly.Handle}")
+                self.log_msg("     " + _low_point_note(info))
+        except Exception as e:
+            err = e
+        finally:
+            self.root.deiconify(); self.root.lift()
+
+        if warn:
+            self.log_msg(warn)
+        if err is not None:
+            messagebox.showerror("生成失败", str(err))
+            self.log_msg(f"✘ 生成失败: {err}")
+            return
+        if not segs:
+            if not warn:          # warn 已在上方记录过，避免重复
+                self.log_msg("✘ 已取消点选（未生成曲线）")
+            return
+
+        # 断面图通常已有整幅图框，缩放会打断视图 —— 有意不调 ZoomExtents
+        last_info, last_handle, last_mode = segs[-1][0], segs[-1][1], segs[-1][2]
+        last_mark = segs[-1][5]
+        tip = "" if last_mode == "lwpolyline" else "（本 CAD 无二维多段线接口，已退化为三维多段线 Z=0）"
+        total_L = sum(s[0]["L_real"] for s in segs)
+        msg = (f"{param_desc}{tip}  共 {len(segs)} 段\n"
+               f"累计实际档距={total_L:.2f}m  末段: 实际高差={last_info['h_real']:.2f}m  "
+               f"实际弧垂={last_info['sag_real']:.3f}m  图上弧垂={last_info['sag_plot']:.2f}  "
+               f"a={last_info['a']:.1f}m")
+        # ⑥ 块下方的说明栏是**固定用法说明**，不随生成结果变化 —— 结果只写日志区
+        self.log_msg("✔ 已连续生成二维断面弧垂曲线: " + msg.replace("\n", "  "))
+        self.log_msg(f"  末段 Handle={last_handle}  倒三角标记 Handle={last_mark}")
+
     # ---- 工具 -------------------------------------------------------
     def _is_user_cancel(self, e):
         """判断 COM 异常是否由用户取消 (ESC / 右键) 引起。"""
-        s = str(e).lower()
-        return any(k in s for k in ("cancel", "已取消", "userinterrupt",
-                                    "user cancel", "discard"))
+        return _is_cancel_error(e)
+
+    def _pick_abort(self, e, what="点选"):
+        """拾取阶段的异常统一收尾（①②③④⑤⑥ 共用）—— 按 ESC 取消不再"报错"。
+
+        背景：各 CAD 的取消文案不统一（"用户取消" / "已取消" / Cancel / ESC…），
+        只靠文案判定必然漏判，漏判就会把「用户取消」误报成「点选失败」（历史痛点）。
+        故此处对**任何**拾取异常都按「用户主动中止」处理：
+        **不弹错误框**，只在日志里留一句（非取消类附原始文案备查），调用方直接 return。
+        """
+        if _is_cancel_error(e):
+            self.log_msg(f"✘ {what}已取消，未生成任何图元")
+        else:
+            self.log_msg(f"✘ {what}已中止（{e}），未生成任何图元")
 
     def _ensure_conn(self):
         if self.doc is None:
@@ -695,13 +836,27 @@ def main():
 # 命令行模式 (CLI)
 # ───────────────────────────────────────────────────────────────────
 
+def _cli_pick(fn, *a, **kw):
+    """CLI 交互拾取的统一包装（①~⑥ 共用）—— 按 ESC 取消不再抛 traceback。
+
+    各 CAD 的取消文案不统一，无法只靠文案保证命中，故非取消类异常也一并
+    转成一句可读信息（附原文），避免用户面对满屏栈帧。
+    """
+    try:
+        return fn(*a, **kw)
+    except Exception as e:
+        if _is_cancel_error(e):
+            sys.exit("已取消，未生成任何图元")
+        sys.exit(f"✘ 拾取失败：{e}")
+
+
 def _cli_draw(args):
     gc, doc, ms, _app = get_gcad_or_elevate(getattr(args, "cad", None))
     if args.pick:
         print("→ 在 CAD 中点选第1个悬挂点 …", flush=True)
-        p1 = pick_point(doc, "\n选择第1个悬挂点: ")
+        p1 = _cli_pick(pick_point, doc, "\n选择第1个悬挂点: ")
         print("→ 在 CAD 中点选第2个悬挂点 …", flush=True)
-        p2 = pick_point(doc, "\n选择第2个悬挂点: ")
+        p2 = _cli_pick(pick_point, doc, "\n选择第2个悬挂点: ")
     else:
         p1 = tuple(float(v) for v in args.p1)
         p2 = tuple(float(v) for v in args.p2)
@@ -729,13 +884,99 @@ def _cli_draw(args):
     print(f"  Handle={poly.Handle}")
 
 
+def _cli_draw2d(args):
+    """二维断面悬链线：图上坐标 ÷ 比例 → 实际米 → 算 K 值悬链线 → × 比例画回图上。
+
+    交互模式（--pick）支持**连续点选**：点第 2 点生成第 1 段后不退出，继续点
+    第 3 点即以「上一段终点」为新起点生成下一段，K 值与比例全程相同；
+    按 ESC / 右键结束。端点不合法（如 X 相同）的段自动跳过并提示。
+    """
+    gc, doc, ms, _app = get_gcad_or_elevate(getattr(args, "cad", None))
+    K = float(args.K) * 1e-5          # 只做 K 值选项，不做 σ₀+γ
+    rx, ry = float(args.rx), float(args.ry)
+    if rx <= 0 or ry <= 0:
+        sys.exit("✘ 图纸比例分母必须为正数")
+    layer = args.layer or LAYER_NAME
+    segs = []                          # [(info, handle, mode, p_from, p_to), ...]
+
+    def _draw_seg(p_from, p_to):
+        """生成一段；起止点不合法时抛 ValueError，由调用方决定跳过还是退出。"""
+        pts, info = catenary_section_2d(p_from, p_to, K, rx, ry, args.n)
+        poly, mode = draw_catenary_2d(doc, ms, pts, layer=layer)
+        # 最低点倒三角标记（顶点＝最低点，画在曲线上方；随比例缩放）
+        mark, _mk_mode = draw_low_point_marker(doc, ms, info["marker_pts"], layer=layer)
+        segs.append((info, poly.Handle, mode, p_from, p_to, mark.Handle))
+        print(f"✔ 段{len(segs)}: 实际档距={info['L_real']:.2f}m  "
+              f"实际高差={info['h_real']:.2f}m  实际弧垂={info['sag_real']:.3f}m  "
+              f"图上弧垂={info['sag_plot']:.2f}   Handle={poly.Handle}", flush=True)
+        print("    " + _low_point_note(info) + f"  标记Handle={mark.Handle}", flush=True)
+
+    if args.pick:
+        print("→ 在 CAD 中连续点选挂点（每点一次生成一段，ESC/右键结束）…", flush=True)
+        try:
+            p_prev = pick_point(doc, "\n选择第1个挂点: ")
+        except Exception as e:
+            if _is_cancel_error(e):
+                print("已取消，未生成曲线")
+                return
+            raise
+        while True:
+            prompt = ("\n选择第2个挂点: " if not segs
+                      else "\n选择下一个挂点 (ESC/右键结束): ")
+            try:
+                p_next = pick_point(doc, prompt)
+            except Exception as e:
+                if _is_cancel_error(e):
+                    break              # ESC / 右键 = 正常结束连续点选
+                # 兜底：取点失败一律结束链路（已画的段保留），不依赖取消文案
+                print(f"⚠ 连续点选已结束（取点失败：{e}），已生成的曲线保留", flush=True)
+                break
+            try:
+                _draw_seg(p_prev, p_next)
+            except ValueError as e:
+                print(f"⚠ 本段已跳过（{e}）请另选一个挂点", flush=True)
+                continue               # 起止点不变，等待下一个挂点
+            p_prev = p_next
+        if not segs:
+            print("未生成任何曲线（已取消）")
+            return
+    else:
+        p1 = tuple(float(v) for v in args.p1)
+        p2 = tuple(float(v) for v in args.p2)
+        try:
+            _draw_seg(p1, p2)
+        except ValueError as e:
+            sys.exit(f"✘ {e}")
+
+    # 断面图通常已有整幅图框，缩放会打断视图 —— 有意不调 ZoomExtents
+    last_info, last_handle, last_mode = segs[-1][0], segs[-1][1], segs[-1][2]
+    print("✔ 已生成二维断面弧垂曲线")
+    print(f"  K={args.K}×10⁻⁵  横向1:{rx:g}  纵向1:{ry:g}  "
+          f"(scale_x={last_info['scale_x']:g}  scale_y={last_info['scale_y']:g})")
+    print(f"  P1=({segs[0][3][0]:.3f}, {segs[0][3][1]:.3f})   "
+          f"P末=({segs[-1][4][0]:.3f}, {segs[-1][4][1]:.3f})")
+    print(f"  共 {len(segs)} 段  累计实际档距={sum(s[0]['L_real'] for s in segs):.2f}m")
+    print(f"  末段: 实际高差={last_info['h_real']:.2f}m  实际弧垂={last_info['sag_real']:.3f}m  "
+          f"图上弧垂={last_info['sag_plot']:.2f}")
+    n_note = (f"{last_info['n_pts']}→{last_info['n_pts_used']}（延伸后加密）"
+              if last_info["extended"] else f"{last_info['n_pts']}")
+    print(f"  悬链线参数 a={last_info['a']:.2f}m  采样点数={n_note}")
+    print(f"  {_low_point_note(last_info)}")
+    print(f"  图层={layer}  类型="
+          + ("二维多段线(AcDbPolyline)" if last_mode == "lwpolyline"
+             else "三维多段线(AcDb3dPolyline, Z=0 兜底)"))
+    print(f"  末段 Handle={last_handle}  倒三角标记 Handle={segs[-1][5]}")
+    print(f"  倒三角标记: 顶点=最低点 顶边={last_info['marker_w']:g} 高={last_info['marker_h']:g} "
+          f"（比例 1:{rx:g}/1:{ry:g}；随比例等比缩放）")
+
+
 def _cli_mindist(args):
     gc, doc, ms, _app = get_gcad_or_elevate(getattr(args, "cad", None))
     if args.pick:
         print("→ 在 CAD 中点选第1条曲线 …", flush=True)
-        e1 = pick_entity(doc, "\n选择第1条曲线: ", _app)
+        e1 = _cli_pick(pick_entity, doc, "\n选择第1条曲线: ", _app)
         print("→ 在 CAD 中点选第2条曲线 …", flush=True)
-        e2 = pick_entity(doc, "\n选择第2条曲线: ", _app)
+        e2 = _cli_pick(pick_entity, doc, "\n选择第2条曲线: ", _app)
     else:
         e1 = get_entity_by_handle(ms, args.h1)
         e2 = get_entity_by_handle(ms, args.h2)
@@ -757,10 +998,10 @@ def _cli_wind(args):
         print(f"→ 已按句柄 {args.handle} 定位曲线")
     else:
         print("→ 在 CAD 中点选一条弧垂曲线 …", flush=True)
-        ent = pick_entity(doc, "\n请选择一条弧垂曲线: ", _app)
+        ent = _cli_pick(pick_entity, doc, "\n请选择一条弧垂曲线: ", _app)
         print(f"→ 已拾取曲线 (句柄 {ent.Handle})")
     if args.angle is None:
-        angle = pick_angle(doc, "\n请输入风偏角(度, 右偏为正): ")
+        angle = _cli_pick(pick_angle, doc, "\n请输入风偏角(度, 右偏为正): ")
     else:
         angle = args.angle
     print(f"→ 风偏角 = {angle}°")
@@ -780,7 +1021,7 @@ def _cli_bundle(args):
         print(f"→ 已按句柄 {args.handle} 定位中心线")
     else:
         print("→ 在 CAD 中点选中心线 …", flush=True)
-        ent = pick_entity(doc, "\n请选择中心线(弧垂曲线): ", _app)
+        ent = _cli_pick(pick_entity, doc, "\n请选择中心线(弧垂曲线): ", _app)
         print(f"→ 已拾取中心线 (句柄 {ent.Handle})")
     d_m = args.d / 1000.0  # 用户单位 mm → 绘图单位 m
     mode_map = {"horiz": BUNDLE_HORIZ, "vert": BUNDLE_VERT, "quad": BUNDLE_QUAD}
@@ -802,9 +1043,9 @@ def _cli_suspension(args):
     gc, doc, ms, _app = get_gcad_or_elevate(getattr(args, "cad", None))
     if args.pick:
         print("→ 在 CAD 中点选第1个悬挂点 …", flush=True)
-        p1 = pick_point(doc, "\n选择第1个悬挂点: ")
+        p1 = _cli_pick(pick_point, doc, "\n选择第1个悬挂点: ")
         print("→ 在 CAD 中点选第2个悬挂点 …", flush=True)
-        p2 = pick_point(doc, "\n选择第2个悬挂点: ")
+        p2 = _cli_pick(pick_point, doc, "\n选择第2个悬挂点: ")
     else:
         p1 = tuple(float(v) for v in args.p1)
         p2 = tuple(float(v) for v in args.p2)
@@ -891,6 +1132,18 @@ def cli_main():
     d.add_argument("--p1", nargs=3, metavar=("X", "Y", "Z"), help="第1点坐标")
     d.add_argument("--p2", nargs=3, metavar=("X", "Y", "Z"), help="第2点坐标")
 
+    d2 = sub.add_parser("draw2d", parents=[parent],
+                        help="二维断面悬链线（平面图，带图纸比例）")
+    d2.add_argument("--K", required=True, help="K值(省略10⁻⁵)，如 15.22")
+    d2.add_argument("--rx", type=float, default=5000.0, help="横向出图比例分母，默认 5000（1:5000）")
+    d2.add_argument("--ry", type=float, default=500.0, help="纵向出图比例分母，默认 500（1:500）")
+    d2.add_argument("--n", type=int, default=200, help="采样点数 (默认200)")
+    d2.add_argument("--pick", action="store_true",
+                    help="在CAD中交互点选挂点（连续点选：每点一次生成一段，ESC/右键结束）")
+    d2.add_argument("--p1", nargs=2, metavar=("X", "Y"), help="第1点图上坐标（二维）")
+    d2.add_argument("--p2", nargs=2, metavar=("X", "Y"), help="第2点图上坐标（二维）")
+    d2.add_argument("--layer", default=None, help=f"图层名 (默认 {LAYER_NAME})")
+
     m = sub.add_parser("mindist", parents=[parent], help="两条曲线最小距离")
     m.add_argument("--pick", action="store_true", help="在CAD中交互选两条曲线")
     m.add_argument("--h1", help="第1条曲线句柄")
@@ -952,6 +1205,10 @@ def cli_main():
             if not args.pick and (not args.p1 or not args.p2):
                 parser.error("suspension 需 --pick 或同时提供 --p1 --p2")
             _cli_suspension(args)
+        elif args.cmd == "draw2d":
+            if not args.pick and (not args.p1 or not args.p2):
+                parser.error("draw2d 需 --pick 或同时提供 --p1 X Y --p2 X Y")
+            _cli_draw2d(args)
         else:
             parser.print_help()
     except RuntimeError as e:
@@ -964,7 +1221,8 @@ def cli_main():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ("draw", "mindist", "wind", "bundle", "suspension", "check"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("draw", "draw2d", "mindist", "wind",
+                                             "bundle", "suspension", "check"):
         cli_main()
     else:
         main()

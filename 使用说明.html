@@ -9,6 +9,7 @@
   h1 { border-bottom: 3px solid #2c7be5; padding-bottom: 10px; color: #2c7be5; }
   h2 { color: #444; border-bottom: 1px solid #ddd; padding-bottom: 6px; margin-top: 32px; }
   h3 { color: #555; margin-top: 20px; }
+  h4 { color: #555; margin: 16px 0 6px; font-size: 1em; }
   kbd { background: #eee; border: 1px solid #ccc; border-radius: 3px; padding: 1px 6px; font-size: 0.9em; }
   code { background: #f0f0f0; padding: 2px 5px; border-radius: 2px; font-size: 0.92em; }
   pre { background: #f7f7f7; border: 1px solid #ddd; border-radius: 4px; padding: 12px 16px; overflow-x: auto; font-size: 0.9em; }
@@ -26,10 +27,10 @@
 <body>
 
 <h1>空间弧垂曲线工具</h1>
-<p>作者：Mz | 版本：0.23 | 适用 CAD：AutoCAD / GstarCAD / 中望CAD | 项目地址：<a href="https://github.com/kophmz/catenary-cad-tool" target="_blank">GitHub</a></p>
+<p>作者：Mz | 版本：0.24 | 适用 CAD：AutoCAD / GstarCAD / 中望CAD | 项目地址：<a href="https://github.com/kophmz/catenary-cad-tool" target="_blank">GitHub</a></p>
 
 <h2>一、软件简介</h2>
-<p>本工具用于在 AutoCAD、GstarCAD（浩辰 CAD）或中望 CAD（ZWCAD）中快速生成<strong>三维空间悬链线（弧垂曲线）</strong>，并支持两曲线最小距离测量、风偏弧垂曲线、分裂导线与含悬垂绝缘子串的弧垂线绘制。核心计算基于《电力工程设计手册 架空输电线路设计》式14-1 悬链线方程，K 值直接取用物理值，无需换算。</p>
+<p>本工具用于在 AutoCAD、GstarCAD（浩辰 CAD）或中望 CAD（ZWCAD）中快速生成<strong>三维空间悬链线（弧垂曲线）</strong>，并支持两曲线最小距离测量、风偏弧垂曲线、分裂导线、含悬垂绝缘子串的弧垂线绘制，以及在<strong>二维平面</strong>上按图纸比例绘制<strong>断面弧垂曲线</strong>。核心计算基于《电力工程设计手册 架空输电线路设计》式14-1 悬链线方程，K 值直接取用物理值，无需换算。</p>
 
 <p>支持功能：</p>
 <ol>
@@ -38,6 +39,7 @@
   <li><strong>风偏弧垂曲线</strong> — 选一条弧垂曲线，输入风偏角，生成绕端点连线旋转的蓝色风偏曲线。</li>
   <li><strong>分裂导线</strong> — 以一条弧垂曲线为中心线，按间距生成双分裂（水平/垂直）或四分裂子导线。</li>
   <li><strong>含悬垂串弧垂线</strong> — 悬挂点可设置悬垂绝缘子串（长度、风偏角），支持带风偏的完整弧垂建模。</li>
+  <li><strong>二维断面悬链线</strong>（v0.24 新增）— 在二维平面（XY）上按横向/纵向图纸比例绘制 K 值悬链线，支持<strong>连续点选</strong>多段。</li>
 </ol>
 
 <h2>二、环境要求</h2>
@@ -59,7 +61,9 @@
 空间弧垂曲线工具CLI.exe mindist --pick            # 交互选两条曲线测距
 空间弧垂曲线工具CLI.exe wind --handle E90 --angle 30.6  # 按句柄生成风偏
 空间弧垂曲线工具CLI.exe bundle --pick --d 600 --mode quad   # 四分裂 600mm
-空间弧垂曲线工具CLI.exe suspension --K 15.22 --pick --s1 --d1 3 --s2 --d2 4 --wind --b 20  # 含悬垂串+风偏</pre>
+空间弧垂曲线工具CLI.exe suspension --K 15.22 --pick --s1 --d1 3 --s2 --d2 4 --wind --b 20  # 含悬垂串+风偏
+空间弧垂曲线工具CLI.exe draw2d --K 15.22 --pick              # 二维断面：连续点选（ESC/右键结束）
+空间弧垂曲线工具CLI.exe draw2d --K 15.22 --p1 0 0 --p2 60 10 --rx 5000 --ry 500  # 二维断面：给定图上两点+比例</pre>
 <div class="tip">💡 在 Windows 控制台（GBK 编码）下，输出中的 ✔ ✘ 等符号会显示为 <code>?</code>，属正常容错表现，不影响结果。</div>
 
 <h2>四、角度正负约定（重要）</h2>
@@ -71,12 +75,13 @@
 <p>启动后首先需要连接 CAD：</p>
 <ul>
   <li><strong>目标下拉</strong>：自动 / AutoCAD / GstarCAD / 中望CAD。选择「自动」时程序会识别你当前正在操作的 CAD 窗口。</li>
-  <li>点击「连接/刷新 CAD窗口」，状态栏显示连接结果（如「已连接 AutoCAD Drawing1」）。</li>
-  <li><strong>多版本自动识别</strong>：工具会自动枚举本机所有版本的 AutoCAD / GstarCAD / 中望CAD（如 2020 + 2022 并存），<strong>优先连接已运行的实例（秒级响应）</strong>，全部未开启才自动启动。</li>
+  <li>点击「连接/刷新 CAD窗口」，状态栏显示连接结果（如「已连接 AutoCAD Drawing1」）。图纸名很长时窗口会自动加宽以完整显示，右侧按钮不会被挤掉。</li>
+  <li><strong>多实例自动识别（v0.24 增强）</strong>：工具会枚举本机所有版本的 AutoCAD / GstarCAD / 中望CAD，并<strong>分别识别同一 CAD 的每一个运行实例</strong>（如 AutoCAD 2020 与 2026 同时打开），按你当前操作的窗口精确连接对应版本。<strong>优先连接已运行的实例（秒级响应）</strong>，全部未开启才自动启动。</li>
+  <li><strong>跟随重连</strong>：目标选「自动」时，每次操作前会重新判定前台 CAD 实例——你切了窗口（哪怕只是切到另一个 AutoCAD 版本）直接点功能按钮即可，程序会自动跟随重连（日志打印「→ 前台已切到 xxx，跟随重连…」）。若把下拉固定成某个 CAD，则按你的选择走、不跟随。</li>
   <li>CAD 必须已启动并打开了图纸，否则连接失败；已连接但无图纸时工具会自动新建一张。</li>
   <li>若连接失败，可点击「诊断 CAD」查看本机注册状态；或在 CLI 运行 <code>空间弧垂曲线工具CLI.exe check</code>。</li>
 </ul>
-<div class="tip">💡 如果同时开着多个 CAD（如 AutoCAD + 中望CAD），选「自动」会连你刚在操作的那个；也可直接在下拉中指定。</div>
+<div class="tip">💡 如果同时开着多个 CAD（如 AutoCAD + 中望CAD + 同族多版本），选「自动」会连你刚在操作的那个；也可直接在下拉中指定某个 CAD 种类。</div>
 
 <h3>① 生成空间弧垂曲线</h3>
 <p>「输入方式」下拉提供两种等价选项，按需选择：</p>
@@ -136,13 +141,42 @@
   <li>点击「拾取两点并生成」→ 在 CAD 中依次点选两个悬挂点（顺序 = 前进方向）。</li>
 </ol>
 
+<h3>⑥ 二维断面悬链线（断面图）</h3>
+<p>用于<strong>纵断面图</strong>：在二维平面（XY）上画 K 值悬链线。与模块①的区别是——①画的是真三维空间曲线（取两点的 X/Y/Z 三轴），⑥画的是二维平面曲线（<strong>只取 X、Y</strong>，拾取点的 Z 被忽略），并且带<strong>图纸比例</strong>。</p>
+<table>
+  <tr><th>输入</th><th>默认</th><th>说明</th></tr>
+  <tr><td>K 值（省略 10⁻⁵）</td><td>15.22</td><td>只支持 K 值输入，不做「应力+比载」</td></tr>
+  <tr><td>图纸比例 · 横向</td><td>5000</td><td>横向（X，档距方向）出图比例分母</td></tr>
+  <tr><td>图纸比例 · 纵向</td><td>500</td><td>纵向（Y，高程方向）出图比例分母</td></tr>
+  <tr><td>采样点数</td><td>200</td><td>与模块①共用同一输入框</td></tr>
+  <tr><td>「拾取挂线点并生成」</td><td>—</td><td>点击后在 CAD 中连续点选挂线点（见下）</td></tr>
+</table>
+
+<h4>比例是什么意思</h4>
+<p>前提：<strong>图纸 1 绘图单位 = 1 mm</strong>，实际工程尺寸用 m。程序先按比例<strong>把图上坐标反算成实际米数</strong>，用 K 值算出真实悬链线，再按比例缩放回图纸坐标画出来：</p>
+<pre>图上坐标 = 实际坐标 × 1000 ÷ 比例分母
+
+横向 1:5000 → 图上 1mm 代表实际 5000mm = 5m → 图上 = 实际 × 1000/5000 = ×0.2  （即你说的 1/5）
+纵向 1:500  → 图上 1mm 代表实际  500mm = 0.5m → 图上 = 实际 × 1000/500  = ×2.0  （即你说的 2 倍）</pre>
+<div class="tip">💡 <strong>为什么必须"先反算再缩放"</strong>：K 值（1/m）只有作用在<strong>实际档距</strong>上才有物理意义。若直接拿图上坐标当米用，档距会被缩小 5 倍，画出来的线几乎成了直线——输入 K 值这个动作就白做了。因为反算与缩放互为逆运算，所以<strong>曲线两端会精确落在你点的两个点上</strong>，中间按真实 K 值下垂。</div>
+
+<h4>连续点选（v0.24）</h4>
+<ol>
+  <li>点击「拾取两点并生成」— 窗口自动最小化，切换到 CAD。</li>
+  <li>点<strong>第 1 点</strong>（起点）、点<strong>第 2 点</strong> → 立即生成第 1 段曲线（1-2）。</li>
+  <li><strong>不退出</strong>：继续点第 3 点 → 以第 2 点（上一段终点）为起点生成第 2 段曲线（2-3）；点第 4 点 → 生成 3-4 段……可一直连下去。K 值与比例全程相同。</li>
+  <li>按 <strong>ESC 或鼠标右键</strong>结束连续点选（已生成的段全部保留）。</li>
+</ol>
+<div class="tip">💡 若某一段的起点与终点 X 相同（两点在图上水平投影重合，无法确定档距方向），该段会<strong>自动跳过</strong>并提示，不影响后续继续点选。若取点过程出现异常，也会结束连续点选并保留已画曲线，不会丢结果。</div>
+<p>输出：红色二维多段线，图层「悬链线」，画在 Z=0 平面；<strong>不自动缩放视图</strong>（断面图通常已有整幅图框，自动 ZoomExtents 会打断视图）。生成后可继续用模块②量取与其它曲线的最小距离。</p>
+
 <h2>六、命令行参数速查</h2>
 <table>
   <tr><th>参数</th><th>说明</th><th>示例</th></tr>
   <tr><td><code>--K</code></td><td>K 值（省略 10⁻⁵）</td><td><code>--K 15.22</code></td></tr>
   <tr><td><code>--sigma / --gamma</code></td><td>导线应力 σ₀(N/mm²) / 比载 γ(N/(m·mm²))，与 --K 二选一（K=γ/(8σ₀)）</td><td><code>--sigma 50 --gamma 0.06088</code></td></tr>
   <tr><td><code>--n</code></td><td>采样点数，默认 200</td><td><code>--n 500</code></td></tr>
-  <tr><td><code>--p1 / --p2</code></td><td>悬挂点坐标 x y z</td><td><code>--p1 0 0 0 --p2 100 30 12</code></td></tr>
+  <tr><td><code>--p1 / --p2</code></td><td>悬挂点坐标 x y z（<code>draw</code>/<code>suspension</code>）；<strong><code>draw2d</code> 为二维 x y</strong></td><td><code>--p1 0 0 0 --p2 100 30 12</code></td></tr>
   <tr><td><code>--pick</code></td><td>交互拾取（CAD 中点选）</td><td><code>--pick</code></td></tr>
   <tr><td><code>--handle</code></td><td>按句柄指定图元（16 进制）</td><td><code>--handle E90</code></td></tr>
   <tr><td><code>--angle</code></td><td>风偏角（度，右偏为正）</td><td><code>--angle 30.6</code></td></tr>
@@ -152,6 +186,8 @@
   <tr><td><code>--d1 / --d2</code></td><td>串长 D1/D2（m）</td><td><code>--d1 3 --d2 4</code></td></tr>
   <tr><td><code>--a1 / --a2</code></td><td>串风偏角 A1/A2（°，右偏为正）</td><td><code>--a1 10 --a2 -5</code></td></tr>
   <tr><td><code>--wind / --b</code></td><td>绘制风偏线 / 线偏角 B（°）</td><td><code>--wind --b 20</code></td></tr>
+  <tr><td><code>--rx / --ry</code></td><td>仅 <code>draw2d</code>：横向 / 纵向图纸比例分母，默认 5000 / 500</td><td><code>--rx 5000 --ry 500</code></td></tr>
+  <tr><td><code>--layer</code></td><td>仅 <code>draw2d</code>：输出图层名，默认「悬链线」</td><td><code>--layer 悬链线</code></td></tr>
   <tr><td><code>--cad</code></td><td>强制指定 CAD：autocad / gstar / zwcad</td><td><code>--cad zwcad</code></td></tr>
 </table>
 
@@ -182,10 +218,24 @@
 <h3>Q: 分裂导线方向不对 / 画歪了</h3>
 <p>分裂方向基于"弦平面局部坐标系"，风偏后的曲线分裂方向随平面旋转是正确行为（子导线与中心线平行、间距恒为 d）。若觉得"歪"，是风偏场景下的正常几何。</p>
 
+<h3>Q: 二维断面（⑥）画出来的弧垂特别小，几乎像直线</h3>
+<p>先确认两点：① <strong>档距是不是够大</strong>——⑥ 会按横向比例把图上档距反算成实际档距，图上 60 单位在 1:5000 下相当于实际 300m，弧垂才明显；若横向比例填得很大（如 1:20000），实际档距变短、弧垂自然小。② <strong>图纸单位是不是 mm</strong>——本功能按「图纸 1 绘图单位 = 1 mm」设计；若你的图是按 1:1（单位=米）画的，需要把比例分母相应换算后再填。</p>
+
+<h3>Q: 二维断面（⑥）生成后看不到线 / 视图没变化</h3>
+<p>⑥ <strong>不自动缩放视图</strong>（断面图通常已有整幅图框，自动 ZoomExtents 会打断视图）——请手动缩放/平移查看。曲线画在 <strong>Z=0 平面</strong>（拾取点的 Z 被忽略），若你的图纸工作平面不在 Z=0，或用了旋转的 UCS，请先切回世界坐标系（UCS → 世界）再操作。</p>
+
+<h3>Q: 同时开了 AutoCAD 2020 和 2026（或同一 CAD 多个版本），切窗口后画错 CAD</h3>
+<p>v0.24 起已修复：程序会<strong>把同一 CAD 的每个实例都识别出来</strong>，并按你当前操作的那个窗口精确连接对应版本。请把「目标」下拉保持为<strong>「自动」</strong>——每次操作前程序都会重新判定前台实例，切了窗口直接点功能按钮即可（日志会打印「→ 前台已切到 xxx，跟随重连…」）。若把下拉固定成某个 CAD，则不跟随、按你的选择走。</p>
+
+<h3>Q: 连接后状态栏的图纸名被截断 / 「连接/刷新」按钮看不全</h3>
+<p>连接图纸名很长时，窗口会<strong>自动加宽</strong>（上限 1100px）以完整显示，「连接/刷新 CAD窗口」等按钮始终完整、不会被挤掉；只有名字长到连上限都放不下时，才在<strong>中间</strong>省略并保留尾部（如 <code>…明细表.dwg ✓</code>）。名字变短后窗口会自动缩回。若仍显示不全，可再点一次「连接/刷新 CAD窗口」。</p>
+
 <h2>八、颜色与图层总览</h2>
 <table>
   <tr><th>图元</th><th>颜色</th><th>图层</th></tr>
   <tr><td>弧垂曲线（基准）</td><td>红</td><td>悬链线</td></tr>
+  <tr><td>二维断面悬链线（⑥）</td><td>红</td><td>悬链线</td></tr>
+  <tr><td>弧垂最低点倒三角标记（⑥）</td><td>红</td><td>悬链线</td></tr>
   <tr><td>最小距离连线 / 标注</td><td>绿</td><td>最小距离示意</td></tr>
   <tr><td>风偏弧垂曲线</td><td>蓝</td><td>风偏弧垂曲线</td></tr>
   <tr><td>分裂导线（子导线）</td><td>黄</td><td>分裂导线</td></tr>
@@ -201,6 +251,7 @@
   <li><strong>风偏旋转</strong>：Rodrigues 旋转公式，绕首尾端点连线为轴</li>
   <li><strong>分裂导线</strong>：弦平面局部坐标（u 弦向 / n 平面法线 / v=n×u），子导线 = 中心线等距平移</li>
   <li><strong>悬垂串</strong>：下端 = 上端 + right·D·sin(A) − z·D·cos(A)；风偏线 = 摆串端点基准绕弦转 B</li>
+  <li><strong>二维断面悬链线（⑥）</strong>：图上坐标 ↔ 实际米数互换（<code>scale = 1000 ÷ 比例分母</code>），先反算实际档距/高差算 K 值悬链线，再缩放回图纸坐标；曲线类型 AcDbPolyline（二维多段线，Z=0；若目标 CAD 无此接口则自动退化为 AcDb3dPolyline 传 Z=0）</li>
 </ul>
 
 <h2>十、开源许可与项目地址</h2>

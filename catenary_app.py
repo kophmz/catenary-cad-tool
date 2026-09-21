@@ -62,11 +62,12 @@ from catenary_cad import (
     # 连接
     get_gcad,
     get_gcad_or_elevate,
-    foreground_cad_prefer,
+    foreground_cad_target,
     diagnose_cad_connection,
     # CAD 家族配置表（GUI 下拉 / CLI choices / 文案的唯一出处）
     cad_family_labels,
     cad_family_keys,
+    cad_label_of,
     _all_cad_names,
     # 图层
     ensure_layer,
@@ -135,11 +136,26 @@ class CatenaryApp:
     def __init__(self, root):
         self.root = root
         root.title("空间弧垂曲线工具 · CAD · v0.24")
-        root.geometry("700x1000")
-        root.resizable(False, False)
+        # 高度固定、**宽度随内容自适应**（见 _render_status）：长图纸名会把窗口
+        # 撑宽，而不是把「连接/刷新」按钮切掉一半。
+        # ⚠️ 不能用 root.resizable(False, False) 来禁止用户缩放 —— 它会把窗口的
+        # 最大尺寸钉死在「设置那一刻的宽度」，之后程序再调 geometry() 加宽会被
+        # Windows 直接夹回去（实测设 860 仍停在 720）。改用 min=max=当前尺寸，
+        # 既禁止用户拖拽，又允许程序改宽。
+        self._win_h = 1000
+        self._win_min_w = 720
+        # 宽度上限：超过它就不再把窗口拉宽（否则长名字会把窗口拉满整个屏幕），
+        # 改为把状态文字中间省略 —— 取 1100 可显示约 50 字的图纸名。
+        self._win_max_w = 1100
+        self._status_pending = False
+        self._rendering = False        # _render_status 重入护栏
+        self._set_window_width(self._win_min_w)
 
         self.gc = self.doc = self.ms = None
         self.app_name = None  # 连接后记录的 CAD 名称（AutoCAD / GstarCAD / 中望CAD）
+        # 已连实例的主窗口句柄：多 CAD / 同 CAD 多版本共存时，
+        # 用它判断「用户是否把另一个实例切到了前台」，以便自动跟随重连
+        self._conn_hwnd = None
 
         self._build_ui()
 
@@ -150,21 +166,32 @@ class CatenaryApp:
         # 连接状态
         f0 = ttk.LabelFrame(self.root, text="连接")
         f0.pack(fill="x", **pad)
-        self.status_var = tk.StringVar(value="未连接")
-        ttk.Label(f0, textvariable=self.status_var).pack(side="left")
+        self._conn_frame = f0  # 供 _conn_bar_extra 计算宽度占用
+        # ⚠️ pack 是按调用顺序分配空间的：必须**先 pack 右侧按钮、再 pack 状态文字**。
+        # 顺序反过来时，长图纸名会先把空间吃满（实测「已连接 GstarCAD S17101S-D0301
+        # 平断面图及杆塔明细表.dwg ✓」独占 363px，栏内仅有 692px，而三个按钮需
+        # 302px + 目标选择器 104px），后 pack 的「连接/刷新 CAD窗口」只能分到 43px
+        # 而被切掉一半。按钮优先分配 → 文字让位并自行省略（见 _render_status）。
+        ttk.Button(f0, text="使用说明", command=self.open_help).pack(side="right", padx=(0, 4))
+        ttk.Button(f0, text="诊断 CAD", command=self.diagnose).pack(side="right", padx=(0, 4))
+        ttk.Button(f0, text="连接/刷新 CAD窗口", command=self.connect).pack(side="right")
         # 目标 CAD 选择器：自动检测 + 配置表里全部 CAD（见 catenary_cad._CAD_FAMILIES）
         # （自动模式按表序兜底；多开时用此项强制指定，避免连错 CAD）
         self.cad_prefer_var = tk.StringVar(value="自动")
         sel = ttk.Frame(f0)
-        sel.pack(side="left", padx=8)
+        sel.pack(side="right", padx=(8, 8))
         ttk.Label(sel, text="目标:").pack(side="left")
         ttk.OptionMenu(
             sel, self.cad_prefer_var, "自动",
             *(["自动"] + [lbl for _, lbl in cad_family_labels()]),
         ).pack(side="left")
-        ttk.Button(f0, text="使用说明", command=self.open_help).pack(side="right", padx=(0,4))
-        ttk.Button(f0, text="诊断 CAD", command=self.diagnose).pack(side="right", padx=(0,4))
-        ttk.Button(f0, text="连接/刷新 CAD窗口", command=self.connect).pack(side="right")
+        # 状态文字最后 pack：吃掉剩余宽度，过长时中间省略（不硬裁、不挤按钮）
+        self.status_var = tk.StringVar(value="未连接")
+        self.status_show_var = tk.StringVar(value="未连接")
+        self.status_var.trace_add("write", self._on_status_change)
+        self.status_lbl = ttk.Label(f0, textvariable=self.status_show_var, anchor="w")
+        self.status_lbl.pack(side="left", fill="x", expand=True)
+        self.status_lbl.bind("<Configure>", self._on_status_resize)
 
         # 模块 1：生成弧垂曲线（支持 K 值 / 应力σ₀+比载γ 两种输入）
         f1 = ttk.LabelFrame(self.root, text="① 生成空间弧垂曲线")
@@ -320,22 +347,26 @@ class CatenaryApp:
         ttk.Label(s2row, text="K 值 (省略10⁻⁵):").pack(side="left")
         self.sec_k_var = tk.StringVar(value="15.22")
         ttk.Entry(s2row, textvariable=self.sec_k_var, width=8).pack(side="left", padx=2)
-        ttk.Label(s2row, text="横向 1:").pack(side="left", padx=(10, 0))
+        ttk.Label(s2row, text="图纸比例").pack(side="left", padx=(12, 0))
+        ttk.Label(s2row, text="横向").pack(side="left", padx=(6, 0))
         self.sec_rx_var = tk.StringVar(value="5000")
         ttk.Entry(s2row, textvariable=self.sec_rx_var, width=7).pack(side="left", padx=2)
-        ttk.Label(s2row, text="纵向 1:").pack(side="left", padx=(6, 0))
+        ttk.Label(s2row, text="纵向").pack(side="left", padx=(6, 0))
         self.sec_ry_var = tk.StringVar(value="500")
         ttk.Entry(s2row, textvariable=self.sec_ry_var, width=6).pack(side="left", padx=2)
         ttk.Label(s2row, text="采样点数:").pack(side="left", padx=(6, 0))
         ttk.Entry(s2row, textvariable=self.n_var, width=5).pack(side="left", padx=2)
         ttk.Button(s2row, text="拾取挂线点并生成", command=self.do_section).pack(side="right")
+        # 说明栏：显式按句分行（每行一个完整句子），wraplength 取足够大，
+        # 避免 Tk 只按空格断词而在句子中间折行（会出现一行孤字）。
         self.sec_info = tk.StringVar(
             value="可连续点选：点第 1、2 点生成第 1 段，之后每点一次接一段"
-                  "（上段终点＝本段起点），ESC/右键结束。X＝档距方向、Y＝高程方向。"
+                  "（上段终点＝本段起点），ESC/右键结束。\n"
+                  "X＝档距方向、Y＝高程方向。\n"
                   "比例：图纸 1 单位＝1mm → 横向 1:5000 时图上 1mm＝实际 5m（×1/5），"
                   "纵向 1:500 时图上 1mm＝实际 0.5m（×2）。")
         ttk.Label(f2d, textvariable=self.sec_info, foreground="#444",
-                  wraplength=620, justify="left").pack(anchor="w")
+                  wraplength=690, justify="left").pack(anchor="w")
 
         # 署名（先 pack 固定底部空间，日志框再占剩余空间）
         tk.Label(self.root, text="作者：Mz  ·  github.com/kophmz/catenary-cad-tool",
@@ -359,34 +390,212 @@ class CatenaryApp:
         else:
             messagebox.showinfo("说明文档", "未找到使用说明.html，请确认文件与程序在同一目录下。")
 
+    # ---- 状态栏与窗口宽度自适应 --------------------------------------
+    def _screen_work_width(self):
+        """窗口可用的最大宽度：屏幕宽 - 左右边距（防止撑出屏幕）。"""
+        try:
+            return max(self._win_min_w, self.root.winfo_screenwidth() - 40)
+        except Exception:
+            return self._win_min_w
+
+    def _conn_bar_extra(self):
+        """「连接」栏里除状态文字以外的固定占用（控件需求宽 + 各种 padding）。
+
+        按组件实测而非 estimate，避免改按钮/下拉文字后这里失配：
+        按钮 padx=(0,4)×3 + 目标框 padx=(8,8) + LabelFrame 边框 + 外层 padx=12×2。
+        ⚠️ 不能用 root.winfo_reqwidth() —— 它对子控件需求变化的更新是滞后的
+        （实测设置长文本后它仍返回旧值，导致窗口宽度算不出来）。
+        """
+        total = 0
+        for w in self._conn_frame.winfo_children():
+            if w is not self.status_lbl:
+                total += w.winfo_reqwidth()
+        return total + 12 + 16 + 4 + 24
+
+    def _on_status_change(self, *_a):
+        """status_var 一变就排队重绘（合并同帧内多次 set，避免重入）。"""
+        if self._status_pending:
+            return
+        self._status_pending = True
+        try:
+            self.root.after_idle(self._render_status)
+        except Exception:
+            self._status_pending = False
+
+    def _render_status(self):
+        """状态文字 + 窗口宽度一起自适应。
+
+        先把**全文**放上去让 Tk 算出真实宽度，再把窗口撑到刚好放得下
+        （下限 _win_min_w、上限 min(屏幕可用宽, _win_max_w)）。这样长图纸名
+        （「已连接 GstarCAD S17101S-D0301 平断面图及杆塔明细表.dwg ✓」）既不
+        挤掉右侧「连接/刷新」按钮，也不用牺牲信息；只有撑到上限仍放不下时，
+        才退化为中间省略 + 保留尾部（见 _elide_to_fit）。
+
+        ⚠️ 必须防重入：本函数内部的 `update_idletasks()` 会**触发已排队的
+        after_idle 回调**（即又一次 _render_status）。没有护栏时第二次调用会
+        量到「已被省略的短文本」，把刚算出的宽窗口又缩回 720。
+        """
+        if self._rendering:
+            return
+        self._rendering = True
+        self._status_pending = False
+        try:
+            full = self.status_var.get()
+            self.status_show_var.set(full)
+            self.root.update_idletasks()
+            full_w = self.status_lbl.winfo_reqwidth()   # 先量全文，再谈省略
+            extra = self._conn_bar_extra()
+            cap = min(self._screen_work_width(), self._win_max_w)
+            w = max(self._win_min_w, min(full_w + extra, cap))
+            self._set_window_width(w)
+            # 用**算出来的**可用宽判断是否省略：实测设置完 geometry 后
+            # update_idletasks() 拿到的 winfo_width() 仍是旧值（WM 尚未回灌），
+            # 会造成「窗口已经变宽、文字却还是省略号」。
+            self._apply_text_fit(max(0, w - extra))
+        except Exception:
+            pass
+        finally:
+            self._rendering = False
+
+    def _apply_text_fit(self, avail):
+        """在 avail 像素内显示状态文字：放得下就全文，放不下才省略。"""
+        if avail <= 1:
+            return
+        prev, self._rendering = self._rendering, True
+        try:
+            full = self.status_var.get()
+            self.status_show_var.set(full)
+            self.root.update_idletasks()
+            if self.status_lbl.winfo_reqwidth() > avail:
+                self.status_show_var.set(self._elide_to_fit(full, avail))
+        except Exception:
+            pass
+        finally:
+            self._rendering = prev
+
+    def _elide_to_fit(self, text, avail):
+        """把文字压进 avail 像素，优先保留**尾部**（`.dwg ✓` 这类辨识度最高的信息）。
+
+        度量一律走 Label 自己的 winfo_reqwidth()（Tk 排版用的同一套字体度量），
+        不用 tkfont.measure —— 实测后者比 Tk 实际排版宽约 25%，会把文字压得过短。
+        """
+        ell = "…"
+        prev, self._rendering = self._rendering, True   # 防重入（见 _render_status）
+
+        def fits(s):
+            self.status_show_var.set(s)
+            self.root.update_idletasks()
+            return self.status_lbl.winfo_reqwidth() <= avail
+
+        try:
+            if fits(text):
+                return text
+            if not fits(ell):
+                return ell
+            # 先保尾部，再二分求「头部最多留几个字」
+            for tail_chars in (12, 8, 5, 0):
+                if len(text) <= tail_chars:
+                    continue
+                tail = text[-tail_chars:] if tail_chars else ""
+                lo, hi, ok = 1, len(text) - tail_chars, 0
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    if fits(text[:mid] + ell + tail):
+                        ok, lo = mid, mid + 1
+                    else:
+                        hi = mid - 1
+                if ok:
+                    return text[:ok].rstrip() + ell + tail
+            return ell
+        finally:
+            self._rendering = prev
+
+    def _set_window_width(self, w):
+        """改宽度、保持高度与纵向位置；若会超出屏幕右缘则整体左移。
+
+        用 min=max=w 固定尺寸（等价于「不可缩放」），同时**必须同步更新 max
+        约束**，否则加宽请求会被 Windows 夹回旧宽度（见 __init__ 注释）。
+        """
+        try:
+            h = getattr(self, "_win_h", 1000)
+            x, y = self.root.winfo_x(), self.root.winfo_y()
+            sw = self.root.winfo_screenwidth()
+            if x < 0:
+                x = 0
+            if x + w > sw:
+                x = max(0, sw - w - 8)
+            if y < 0:
+                y = 0
+            # 三步走：先放开上界（避免出现 maxsize < 当前 minsize 的矛盾区间，
+            # 收窄时会走到这一步），再设 min=max=w 把尺寸钉死，最后设位置尺寸。
+            self.root.maxsize(max(w, self.root.winfo_screenwidth()), h)
+            self.root.minsize(w, h)
+            self.root.maxsize(w, h)
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+    def _on_status_resize(self, _e=None):
+        """状态栏宽度变化后重新适配文字（只写回真变了的文本，避免循环）。"""
+        if self._status_pending or self._rendering:
+            return
+        avail = self.status_lbl.winfo_width()
+        if avail <= 1:
+            return
+        self._apply_text_fit(avail)
+
     # ---- 连接 -------------------------------------------------------
-    def connect(self):
+    def connect(self, silent=False):
+        """连接 CAD（下拉目标 + 前台实例判定）。
+
+        silent=True：失败只写日志、不弹错误框 —— 供「前台切换后自动跟随
+        重连」调用，避免用户每点一次功能按钮就被模态框打断。
+        """
         # 将下拉选择映射到 get_gcad 的 prefer 参数（映射表由配置表生成）
         _prefer_map = {"自动": None}
         _prefer_map.update({lbl: key for key, lbl in cad_family_labels()})
         prefer = _prefer_map.get(self.cad_prefer_var.get(), None)
+
+        # 前台实例判定，拿到 (key, hwnd, progid) 三元组。
+        # 多 CAD / 同 CAD 多版本共存时，只有「产出该窗口的 ProgID」才能连到
+        # 用户眼前的实例（如 AutoCAD 2026 要用 AutoCAD.Application.25，
+        # 而裸别名 AutoCAD.Application 指向的是 2020）。
+        fg = None
+        try:
+            fg = foreground_cad_target(self.root.winfo_id())
+        except Exception:
+            fg = None
+
         if prefer is None:
             # 自动：若某 CAD 确为前台则用它；否则 prefer 保持 None，
             # 交给 get_gcad 按配置表行序兜底
-            fg = foreground_cad_prefer(self.root.winfo_id())
-            prefer = fg
+            prefer = fg[0] if fg else None
             if prefer:
-                _label = dict(cad_family_labels()).get(prefer, prefer)
-                self.log_msg(f"→ 自动检测到：{_label}")
+                self.log_msg(f"→ 自动检测到：{cad_label_of(prefer)}（{fg[2]}）")
             else:
                 self.log_msg(
                     f"→ 自动检测：未发现活跃CAD窗口，按默认顺序尝试（{_all_cad_names()}）")
+        # 精确 ProgID：仅当前台实例与目标 CAD 同类时才锁定；
+        # 用户手动指定了另一种 CAD 时不做精确锁定，尊重其选择
+        exact = fg[2] if (fg and fg[0] == prefer) else None
+
         try:
             self.gc = self.doc = self.ms = None  # 先清空旧连接，确保真正刷新
-            self.gc, self.doc, self.ms, app = get_gcad(prefer)
+            self._conn_hwnd = None
+            self.gc, self.doc, self.ms, app = get_gcad(prefer, progid=exact)
             self.app_name = app  # 供后续 pick_entity 按 CAD 类型选择调用方式
+            # 记录已连实例的窗口句柄（前台切换后自动跟随重连时比对用）
+            self._conn_hwnd = int(getattr(self.gc, "HWND", 0)) or None
             # doc.Name 形如 "Drawing1"（未保存）或完整路径；直接展示连接的窗口
             self.status_var.set(f"已连接 {app} {self.doc.Name} ✓")
             self.log_msg(f"✔ 已连接 {app} {self.doc.Name}（目标={self.cad_prefer_var.get()}）")
+            return True
         except Exception as e:
             self.status_var.set("连接失败")
             err_msg = str(e)
             self.log_msg(f"✘ 连接失败: {e}")
+            if silent:
+                return False
             # 检测管理员权限不匹配 → 询问是否提权重启
             # （get_gcad 已把 HRESULT 转成中文分类 + 场景化诊断）
             if (('管理员身份运行' in err_msg and 'COM 连接被隔离' in err_msg)
@@ -415,6 +624,7 @@ class CatenaryApp:
                     "连接失败",
                     f"无法连接 CAD（{self.cad_prefer_var.get()}）：\n\n{e}",
                 )
+            return False
 
     def diagnose(self):
         """弹出本机 CAD COM 注册诊断结果，帮助用户自助排查。"""
@@ -821,9 +1031,36 @@ class CatenaryApp:
     def _ensure_conn(self):
         if self.doc is None:
             self.connect()
-        if self.doc is None:
-            return False
-        return True
+            return self.doc is not None
+        self._follow_foreground_cad()
+        return self.doc is not None
+
+    def _follow_foreground_cad(self):
+        """自动模式下：用户把另一个 CAD 实例切到前台时，自动把连接切过去。
+
+        多 CAD / 同 CAD 多版本共存时的必要动作 —— 否则连上 CAD A 之后，
+        用户切到 CAD B 的窗口再点功能按钮，仍会画进 A。
+        只在「自动」模式下跟随；用户手动指定了目标 CAD 就尊重其选择。
+        跟随重连失败时保留原连接、不弹错误框（不该打断操作）。
+        """
+        if self.cad_prefer_var.get() != "自动" or not self._conn_hwnd:
+            return
+        try:
+            tgt = foreground_cad_target(self.root.winfo_id())
+        except Exception:
+            return
+        if not tgt:
+            return  # 探测不到任何 CAD 实例 → 保持现状
+        key, hwnd, progid = tgt
+        if hwnd == self._conn_hwnd:
+            return  # 前台仍是已连的那个实例，无需动作
+        # 前台换成了另一个实例 → 先连新的，成功才替换
+        old = (self.gc, self.doc, self.ms, self.app_name, self._conn_hwnd)
+        self.log_msg(f"→ 前台已切到 {cad_label_of(key)}（{progid}），跟随重连…")
+        if not self.connect(silent=True):
+            self.gc, self.doc, self.ms, self.app_name, self._conn_hwnd = old
+            self.status_var.set(f"已连接 {self.app_name} {self.doc.Name} ✓")
+            self.log_msg("  （跟随重连失败，继续使用原连接）")
 
 
 def main():

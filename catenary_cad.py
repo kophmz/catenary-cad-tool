@@ -8,7 +8,8 @@ catenary_cad — CAD COM 交互封装（AutoCAD / GstarCAD / 中望CAD 通用）
 统一 import，消除代码重复（审查意见 Opt 2）。
 
 包含：
-  - 连接：get_gcad / _detect_cad_windows / foreground_cad_prefer
+  - 连接：get_gcad / _detect_cad_instances(→_detect_cad_windows)
+          / foreground_cad_target(→foreground_cad_prefer)
   - 图层：ensure_layer
   - 交互：pick_point / pick_entity / pick_angle
   - 提取：extract_points / get_entity_by_handle
@@ -92,6 +93,11 @@ def _all_cad_names() -> str:
     return " / ".join(lbl for _, lbl in cad_family_labels())
 
 
+def cad_label_of(key: str | None) -> str:
+    """把配置表 key 映射为显示名（如 'gstar' → 'GstarCAD'）；未知 key 原样返回。"""
+    return dict(cad_family_labels()).get(key, key) if key else ""
+
+
 def _list_cad_progids(prefix: str) -> list[str]:
     """动态枚举注册表中以 prefix 开头的所有 ProgID（含版本号），版本新者在前。
 
@@ -127,6 +133,11 @@ def _list_cad_progids(prefix: str) -> list[str]:
     return bare + vers
 
 
+# ProgID 可用性缓存（进程内）：{'AutoCAD.Application.25.1': True, ...}
+# 见 _progid_available / _reset_progid_cache 的说明。
+_PROGID_AVAIL_CACHE: dict[str, bool] = {}
+
+
 def _progid_available(progid: str) -> bool:
     """校验 ProgID 是否真的可用（CLSID 可读且 LocalServer32 的 exe 存在）。
 
@@ -135,8 +146,24 @@ def _progid_available(progid: str) -> bool:
     `_list_cad_progids` 按版本降序排列，会把该残留项排在有效项之前。
     提前剔除可避免：连接时白跑一次失败尝试；报错文案里出现
     "某版本连接失败"这类误导性噪音。
+
+    ⚠️ 带进程内缓存：本函数要读 CLSID + LocalServer32 + 检查 exe 是否存在，
+    实测单个 ProgID 约 8 ms；而「检测正在运行的 CAD 实例」一轮要校验 8 个
+    （且 GUI 每次点功能按钮前都会调一次，见 _detect_cad_instances）。
+    「某 ProgID 是否可用」是**静态事实**（只有装/卸、升降级 CAD 才会变），
+    缓存安全。诊断路径（list_registered_cad / diagnose_cad_connection）
+    会先调 _reset_progid_cache() 强制重读，保证诊断报告不过时。
     """
-    return _get_cad_exe_path(progid) is not None
+    if progid in _PROGID_AVAIL_CACHE:
+        return _PROGID_AVAIL_CACHE[progid]
+    ok = _get_cad_exe_path(progid) is not None
+    _PROGID_AVAIL_CACHE[progid] = ok
+    return ok
+
+
+def _reset_progid_cache() -> None:
+    """清空 ProgID 可用性缓存（诊断/自检路径调用，强制重读注册表）。"""
+    _PROGID_AVAIL_CACHE.clear()
 
 
 def _progids_for(key: str | None = None) -> list[str]:
@@ -262,6 +289,9 @@ def list_registered_cad() -> dict[str, list[str]]:
         若某类为空，表示注册表中未找到对应 COM 注册项。
     """
     result: dict[str, list[str]] = {lbl: [] for _, lbl in cad_family_labels()}
+    # 用户主动查诊断 = 一次刷新机会：清掉 ProgID 可用性缓存，
+    # 使随后 _progids_for 重新校验（安装/卸载 CAD 后能立刻反映）
+    _reset_progid_cache()
     for fam in _CAD_FAMILIES:
         for progid in _list_cad_progids(fam["prefix"]):
             try:
@@ -501,66 +531,93 @@ def _win32():
     return win32com, pythoncom, win32gui, win32con
 
 
-def _detect_cad_windows():
-    """通过 COM GetActiveObject 检测所有正在运行的 CAD 实例的主窗口。
+def _detect_cad_instances():
+    """通过 COM GetActiveObject 检测所有正在运行的 CAD 实例（含多版本/多开）。
 
-    每个 key 只查一次（命中即 break），取 app.HWND 精确获取其主窗口句柄，
-    避免扫描全局窗口列表时 exe/标题匹配不可靠的问题。ProgID 走
-    `_progids_for()`（含注册表残留剔除），与 get_gcad 的候选集保持一致。
+    ⚠️ 与 v0.23「每个 key 命中即 break」写法的关键差别 —— 那版每种 CAD
+    只能报出**一个**实例。而同一 CAD 装多个版本时各版本注册的 CLSID 不同：
+    实测本机（AutoCAD 2020 + AutoCAD 2026 同时在跑）裸别名
+    `AutoCAD.Application` 指向 2020、`AutoCAD.Application.25` 指向 2026。
+    只取首个命中的 2020，会让 2026 的窗口永远进不了候选集合 —— 用户在
+    三个 CAD 窗口之间切换时，Z 序扫描扫到 2026 的窗口也匹配不上，
+    于是「切到 2026，却画进 2020 / 浩辰」。
+
+    因此这里逐个 ProgID 尝试、按 hwnd 去重，并把**产出该 hwnd 的 ProgID**
+    一并带回：后续可用它精确连回用户眼前的那个实例。
+    ProgID 走 `_progids_for()`（含注册表残留剔除），与 get_gcad 候选集一致。
 
     Returns:
-        [(key, hwnd), ...]，如 [('autocad', 0x1234), ('gstar', 0x5678)]。
-        key 取自配置表（'autocad' / 'gstar' / 'zwcad'）。检测不到返回空列表。
+        [(key, hwnd, progid), ...]；同一 hwnd 只保留首次命中的 ProgID
+        （顺序为「裸别名 → 版本高→低」）。检测不到返回空列表。
     """
     win32com, _, win32gui, _ = _win32()
-    results = []
+    results, seen = [], set()
     for key, _label in cad_family_labels():
         for progid in _progids_for(key):
             try:
                 gc = win32com.client.GetActiveObject(progid)
                 hwnd = int(getattr(gc, "HWND", 0))
-                if hwnd and win32gui.IsWindow(hwnd):
-                    results.append((key, hwnd))
-                    break  # 该 CAD 已找到
             except Exception:
                 continue
+            if hwnd and hwnd not in seen and win32gui.IsWindow(hwnd):
+                seen.add(hwnd)
+                results.append((key, hwnd, progid))
     return results
 
 
-def foreground_cad_prefer(self_hwnd=None):
-    """自动模式下，判断用户正在操作的 CAD。
+def _detect_cad_windows():
+    """[(key, hwnd), ...] —— 兼容旧接口，内部实现见 _detect_cad_instances()。
 
-    策略：通过 COM 获取所有正在运行的 CAD 主窗口句柄，再比较它们的 Z 序位置：
-    - 仅一个 CAD 在跑 → 返回它。
-    - 两个都在跑 → 从 Z 序顶层往下找，先出现的那个即用户刚在操作的那个
-      （被 GUI 弹出前最后一次带到前台的 CAD）。
-    - 全没检测到 → 返回 None。
+    需要 ProgID（多版本共存时精确连接用）时请直接调 _detect_cad_instances()。
+    """
+    return [(key, hwnd) for key, hwnd, _progid in _detect_cad_instances()]
 
-    返回配置表的 key（'autocad' / 'gstar' / 'zwcad'）或 None。
+
+def foreground_cad_target(self_hwnd=None):
+    """自动模式下判定「用户正在操作的 CAD 实例」，返回 (key, hwnd, progid)。
+
+    策略（沿用 v0.23 的 Z 序思路，只是不再丢信息）：
+    - 仅一个实例在跑 → 直接返回它（不必猜 Z 序）。
+    - 多个在跑 → 从 Z 序最顶层往下扫，第一个命中的 CAD 实例即用户刚操作过的
+      （被本工具窗口弹出前最后一次带到前台的 CAD）。
+    - 一个都没检测到 → None。
+
+    相比只返回 key 的旧接口，这里额外带回 hwnd 与 progid —— 同一 CAD 装了
+    多个版本时，**只有用产出该窗口的那个 ProgID** 去连接，才能连到用户眼前
+    的实例（AutoCAD 2026 的窗口要用 `AutoCAD.Application.25`，裸别名指向
+    的却是 2020）。
     """
     try:
         _, _, win32gui, win32con = _win32()
-        instances = _detect_cad_windows()
+        instances = _detect_cad_instances()
         if not instances:
             return None
         if len(instances) == 1:
-            # 只跑了一个 CAD，不再需要猜 Z 序——肯定是用户正在用的
-            return instances[0][0]
-        # 两个都在跑：按 Z 序（从上到下）对比，先出现的即最近活跃的
-        hwnd_set = {h for _, h in instances}
+            # 只跑了一个 CAD 实例，不再需要猜 Z 序——肯定是用户正在用的
+            return instances[0]
+        # 多个实例：按 Z 序（从上到下）取第一个命中的，即最近活跃的那个
+        by_hwnd = {item[1]: item for item in instances}
         hwnd = win32gui.GetTopWindow(None)
         while hwnd:
-            if hwnd in hwnd_set:
-                for label, h in instances:
-                    if h == hwnd:
-                        return label
+            if hwnd in by_hwnd:
+                return by_hwnd[hwnd]
             hwnd = win32gui.GetWindow(hwnd, win32con.GW_HWNDNEXT)
     except Exception:
         return None
     return None
 
 
-def get_gcad(prefer=None):
+def foreground_cad_prefer(self_hwnd=None):
+    """自动模式下判定用户正在操作的 CAD，只返回配置表 key（兼容旧接口）。
+
+    需要「key + 精确 ProgID」时请用 foreground_cad_target() ——
+    多版本共存时只靠 key 无法唯一确定实例。
+    """
+    tgt = foreground_cad_target(self_hwnd)
+    return tgt[0] if tgt else None
+
+
+def get_gcad(prefer=None, progid=None):
     """连接 CAD，返回 (gc, doc, ms, app_name)。
 
     支持的 CAD 由 _CAD_FAMILIES 配置表决定（AutoCAD / GstarCAD / 中望CAD）。
@@ -577,6 +634,15 @@ def get_gcad(prefer=None):
       - 配置表里的 key（'autocad' / 'gstar' / 'zwcad'，手动指定）：
         只连该 CAD，连不上即报错，绝不悄悄连到另一种 CAD
         （否则会出现"选了中望CAD 却连上 AutoCAD"）。
+
+    progid:
+      - None（默认）：按上面 prefer 的规则枚举候选 ProgID，命中即连。
+      - 指定 ProgID（如 'AutoCAD.Application.25'）：**提到候选集最前先试**。
+        供「已锁定具体实例」的调用方使用 —— 典型是 GUI 用
+        foreground_cad_target() 拿到产出前台窗口的那个 ProgID。
+        同一 CAD 多版本共存时，仅靠 key 无法区分实例（裸别名指向 2020、
+        .25 才是 2026），必须带 ProgID 才能连对。
+        该 ProgID 连不上时自动退回常规候选顺序，**不会因此完全连不上 CAD**。
     """
     win32com, _, _, _ = _win32()
     if prefer is not None and prefer not in cad_family_keys():
@@ -590,11 +656,16 @@ def get_gcad(prefer=None):
         progids = _progids_for(prefer)
     else:  # 自动：先探测运行实例，单实例精准连
         try:
-            running = _detect_cad_windows()
+            running = _detect_cad_instances()
             progids = (_progids_for(running[0][0]) if len(running) == 1
                        else _progids_for(None))
         except Exception:
             progids = _progids_for(None)
+
+    # 精确 ProgID 优先：调用方已锁定实例（前台窗口就是它产出的）→ 排到最前，
+    # 阶段 1 的第一个 GetActiveObject 就命中目标版本，不会先被裸别名抢走。
+    if progid:
+        progids = [progid] + [p for p in progids if p != progid]
 
     # 每次连接前清空进程检测缓存，避免进程状态过期
     _proc_running_cache.clear()
